@@ -33,4 +33,8 @@ ENV/
 
 # OS
 .DS_Store
-Thumbs.db 
+Thumbs.db
+
+# Large files
+uea_dim256_codebook512.zip
+checkpoints/uea_dim256_codebook512/VQShape.ckpt 
