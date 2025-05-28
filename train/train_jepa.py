@@ -2,6 +2,14 @@ import os
 import pickle
 import torch
 import numpy as np
+import sys
+from pathlib import Path
+
+# 添加项目根目录到 Python 路径
+project_root = str(Path(__file__).parent.parent)
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
 from torch.utils.data import Dataset, DataLoader
 from jepa.encoder import ContextEncoder, TargetEncoder
 from jepa.predictor import JEPPredictor
