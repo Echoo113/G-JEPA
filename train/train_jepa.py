@@ -4,6 +4,9 @@ import torch
 import numpy as np
 import sys
 from pathlib import Path
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from datetime import datetime
 
 # 添加项目根目录到 Python 路径
 project_root = str(Path(__file__).parent.parent)
@@ -56,6 +59,48 @@ class ArrayPatchDataset(Dataset):
             raise TypeError(f"Unsupported type for tgt: {type(tgt)}")
 
         return {'context_patches': ctx, 'target_patches': tgt}
+
+def plot_training_metrics(metrics_history, split_name, save_dir='plots'):
+    """绘制训练指标的历史曲线"""
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 创建图表
+    plt.figure(figsize=(15, 5))
+    
+    # 绘制三个指标
+    plt.subplot(1, 3, 1)
+    plt.plot(metrics_history['loss'], label='Loss')
+    plt.title(f'{split_name} - Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.grid(True)
+    
+    plt.subplot(1, 3, 2)
+    plt.plot(metrics_history['mse'], label='MSE', color='orange')
+    plt.title(f'{split_name} - MSE')
+    plt.xlabel('Epoch')
+    plt.ylabel('MSE')
+    plt.grid(True)
+    
+    plt.subplot(1, 3, 3)
+    plt.plot(metrics_history['mae'], label='MAE', color='green')
+    plt.title(f'{split_name} - MAE')
+    plt.xlabel('Epoch')
+    plt.ylabel('MAE')
+    plt.grid(True)
+    
+    # 调整布局
+    plt.tight_layout()
+    
+    # 保存图表
+    #comment out for now
+    return
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    save_path = os.path.join(save_dir, f'{split_name}_training_metrics_{timestamp}.png')
+    plt.savefig(save_path)
+    plt.close()
+    
+    print(f"Training metrics plot saved to: {save_path}")
 
 def train_on_split(
     split_name: str,
@@ -128,27 +173,67 @@ def train_on_split(
     ckpt_dir = os.path.join('checkpoints', split_name)
     os.makedirs(ckpt_dir, exist_ok=True)
 
+    # 用于记录训练指标
+    metrics_history = {
+        'loss': [],
+        'mse': [],
+        'mae': []
+    }
+
     for epoch in range(1, epochs+1):
         enc_ctx.train(); enc_tgt.train(); predictor.train()
         total_loss = 0.0
+        total_mse  = 0.0
+        total_mae  = 0.0
 
         for batch in loader:
             ctx_raw = batch['context_patches'].to(device)
             tgt_raw = batch['target_patches'].to(device)
 
-            ctx_lat = enc_ctx(ctx_raw)
-            tgt_lat = enc_tgt(tgt_raw)
+            # 编码成 latent
+            ctx_lat = enc_ctx(ctx_raw)   # [B, N_tgt, D]
+            tgt_lat = enc_tgt(tgt_raw)   # [B, N_tgt, D]
 
+            # 预测 & 损失
             preds, loss = predictor(ctx_lat, tgt_lat)
 
+            # 1) 反向 + 更新
             opt.zero_grad()
             loss.backward()
             opt.step()
 
-            total_loss += loss.item() * ctx_raw.size(0)
+            # 2) 累加 loss（原来有的）
+            bsz = ctx_raw.size(0)
+            total_loss += loss.item() * bsz
 
-        avg_loss = total_loss / len(ds)
-        print(f"[{split_name}] Epoch {epoch:02d} — avg loss: {avg_loss:.4f}")
+            # 3) 计算这 batch 的 MSE & MAE
+            #    preds 和 tgt_lat 都是 [B, N, D]
+            mse_batch = F.mse_loss(preds, tgt_lat, reduction='mean').item()
+            mae_batch = F.l1_loss(preds, tgt_lat, reduction='mean').item()
+
+            total_mse += mse_batch * bsz
+            total_mae += mae_batch * bsz
+
+        # 平均到每个样本
+        n_samples = len(ds)
+        avg_loss = total_loss / n_samples
+        avg_mse  = total_mse  / n_samples
+        avg_mae  = total_mae  / n_samples
+
+        # 记录指标
+        metrics_history['loss'].append(avg_loss)
+        metrics_history['mse'].append(avg_mse)
+        metrics_history['mae'].append(avg_mae)
+
+        print(
+            f"[{split_name}] Epoch {epoch:02d} — "
+            f"avg loss: {avg_loss:.4f}  "
+            f"MSE: {avg_mse:.4f}  "
+            f"MAE: {avg_mae:.4f}"
+        )
+
+    # 训练结束后绘制指标曲线
+    plot_training_metrics(metrics_history, split_name)
 
 def train_all_splits(
     ctx_pkl, tgt_pkl,
