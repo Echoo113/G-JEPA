@@ -71,11 +71,11 @@ def plot_training_metrics(metrics_history, split_name, save_dir='/content/drive/
     epochs = range(1, len(metrics_history['loss']) + 1)
     
     # 为每个指标使用不同的颜色和线型
-    plt.plot(epochs, metrics_history['loss'], label=f'{split_name} Loss', 
+    plt.plot(epochs, metrics_history['loss'], label='Loss', 
              color='blue', linewidth=2, linestyle='-')
-    plt.plot(epochs, metrics_history['mse'], label=f'{split_name} MSE', 
+    plt.plot(epochs, metrics_history['mse'], label='MSE', 
              color='orange', linewidth=2, linestyle='-')
-    plt.plot(epochs, metrics_history['mae'], label=f'{split_name} MAE', 
+    plt.plot(epochs, metrics_history['mae'], label='MAE', 
              color='green', linewidth=2, linestyle='-')
     
     # 设置图表属性
@@ -252,14 +252,18 @@ def train_all_splits(
         splits = list(ctx_dict.keys())  # e.g. ['short','long']
 
     # 用于存储所有 split 的指标历史
-    all_metrics = {}
+    all_metrics = {'loss': [], 'mse': [], 'mae': []}
 
     # 2) 对每个 split 调用 train_on_split
     for split in splits:
         ctx_arr = ctx_dict[split]['patches']  # 注意这里要取 'patches' 键
         tgt_arr = tgt_dict[split]['patches']  # 注意这里要取 'patches' 键
+        
         metrics = train_on_split(split, ctx_arr, tgt_arr, **train_kwargs)
-        all_metrics[split] = metrics
+        
+        # 累加每个 split 的指标
+        for k in all_metrics:
+            all_metrics[k].extend(metrics[k])
 
     # 3) 绘制所有 split 的对比图
     plot_training_metrics(all_metrics, 'all')
