@@ -60,47 +60,36 @@ class ArrayPatchDataset(Dataset):
 
         return {'context_patches': ctx, 'target_patches': tgt}
 
-def plot_training_metrics(metrics_history, split_name, save_dir='plots'):
+def plot_training_metrics(metrics_history, split_name, save_dir='/content/drive/MyDrive/Colab Notebooks/plots'):
     """绘制训练指标的历史曲线"""
     os.makedirs(save_dir, exist_ok=True)
     
-    # 创建图表
-    plt.figure(figsize=(15, 5))
+    # 创建单个图表
+    plt.figure(figsize=(10, 6))
     
-    # 绘制三个指标
-    plt.subplot(1, 3, 1)
-    plt.plot(metrics_history['loss'], label='Loss')
-    plt.title(f'{split_name} - Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.grid(True)
+    # 在同一个图表中绘制三个指标
+    epochs = range(1, len(metrics_history['loss']) + 1)
+    plt.plot(epochs, metrics_history['loss'], label='Loss', color='blue', linewidth=2)
+    plt.plot(epochs, metrics_history['mse'], label='MSE', color='orange', linewidth=2)
+    plt.plot(epochs, metrics_history['mae'], label='MAE', color='green', linewidth=2)
     
-    plt.subplot(1, 3, 2)
-    plt.plot(metrics_history['mse'], label='MSE', color='orange')
-    plt.title(f'{split_name} - MSE')
-    plt.xlabel('Epoch')
-    plt.ylabel('MSE')
-    plt.grid(True)
-    
-    plt.subplot(1, 3, 3)
-    plt.plot(metrics_history['mae'], label='MAE', color='green')
-    plt.title(f'{split_name} - MAE')
-    plt.xlabel('Epoch')
-    plt.ylabel('MAE')
-    plt.grid(True)
+    # 设置图表属性
+    plt.title(f'{split_name} - Training Metrics', fontsize=14, pad=15)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Value', fontsize=12)
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(fontsize=10)
     
     # 调整布局
     plt.tight_layout()
     
-    # 保存图表
-    #comment out for now
-    return
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    save_path = os.path.join(save_dir, f'{split_name}_training_metrics_{timestamp}.png')
-    plt.savefig(save_path)
+    # 保存图表到 Google Drive
+
+    save_path = os.path.join(save_dir, f'{split_name}_training_metrics.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
     
-    print(f"Training metrics plot saved to: {save_path}")
+    print(f"Training metrics plot saved to Google Drive: {save_path}")
 
 def train_on_split(
     split_name: str,
