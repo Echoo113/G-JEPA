@@ -87,7 +87,7 @@ def plot_training_metrics(metrics_history, split_name, save_dir='/content/drive/
     
     # 调整布局
     plt.tight_layout()
-    
+    plt.show()
     # 保存图表到 Google Drive
     save_path = os.path.join(save_dir, 'training_metrics_comparison.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -96,20 +96,32 @@ def plot_training_metrics(metrics_history, split_name, save_dir='/content/drive/
     print(f"Training metrics plot saved to Google Drive: {save_path}")
 
 def plot_comparison_metrics(metrics_dict, save_path):
-    """将 short 和 long 的 Loss/MSE/MAE 都画在一张图上"""
+    """将 short 和 long 的 Loss/MSE/MAE 都画在一张图上，6条线都可区分"""
     plt.figure(figsize=(12, 8))
     epochs = range(1, len(next(iter(metrics_dict.values()))['loss']) + 1)
 
+    style_map = {
+        'short-Loss':  {'color': 'blue',   'linestyle': '-',  'marker': 'o'},
+        'short-MSE':   {'color': 'orange', 'linestyle': '--', 'marker': 's'},
+        'short-MAE':   {'color': 'green',  'linestyle': ':',  'marker': '^'},
+        'long-Loss':   {'color': 'red',    'linestyle': '-',  'marker': 'o'},
+        'long-MSE':    {'color': 'purple', 'linestyle': '--', 'marker': 's'},
+        'long-MAE':    {'color': 'brown',  'linestyle': ':',  'marker': '^'},
+    }
+
     for split in metrics_dict:
-        plt.plot(epochs, metrics_dict[split]['loss'], label=f'{split}-Loss', linewidth=2)
-        plt.plot(epochs, metrics_dict[split]['mse'], label=f'{split}-MSE', linewidth=2)
-        plt.plot(epochs, metrics_dict[split]['mae'], label=f'{split}-MAE', linewidth=2)
+        plt.plot(epochs, metrics_dict[split]['loss'], label=f'{split}-Loss', 
+                 **style_map[f'{split}-Loss'])
+        plt.plot(epochs, metrics_dict[split]['mse'], label=f'{split}-MSE', 
+                 **style_map[f'{split}-MSE'])
+        plt.plot(epochs, metrics_dict[split]['mae'], label=f'{split}-MAE', 
+                 **style_map[f'{split}-MAE'])
 
     plt.title('Training Metrics (Short vs Long)', fontsize=14)
     plt.xlabel('Epoch')
     plt.ylabel('Value')
     plt.grid(True, linestyle='--', alpha=0.7)
-    plt.legend(fontsize=10)
+    plt.legend(fontsize=12)
     plt.tight_layout()
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -282,6 +294,8 @@ def train_all_splits(
         tgt_arr = tgt_dict[split]['patches']  # 注意这里要取 'patches' 键
         metrics = train_on_split(split, ctx_arr, tgt_arr, **train_kwargs)
         metrics_dict[split] = metrics
+    
+    
 
     # 3) 保存对比图
     plot_path = "/content/drive/MyDrive/Colab Notebooks/plots/training_comparison.png"
