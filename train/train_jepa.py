@@ -95,6 +95,28 @@ def plot_training_metrics(metrics_history, split_name, save_dir='/content/drive/
     
     print(f"Training metrics plot saved to Google Drive: {save_path}")
 
+def plot_comparison_metrics(metrics_dict, save_path):
+    """将 short 和 long 的 Loss/MSE/MAE 都画在一张图上"""
+    plt.figure(figsize=(12, 8))
+    epochs = range(1, len(next(iter(metrics_dict.values()))['loss']) + 1)
+
+    for split in metrics_dict:
+        plt.plot(epochs, metrics_dict[split]['loss'], label=f'{split}-Loss', linewidth=2)
+        plt.plot(epochs, metrics_dict[split]['mse'], label=f'{split}-MSE', linewidth=2)
+        plt.plot(epochs, metrics_dict[split]['mae'], label=f'{split}-MAE', linewidth=2)
+
+    plt.title('Training Metrics (Short vs Long)', fontsize=14)
+    plt.xlabel('Epoch')
+    plt.ylabel('Value')
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.legend(fontsize=10)
+    plt.tight_layout()
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Training comparison plot saved: {save_path}")
+
 def train_on_split(
     split_name: str,
     ctx_arr,
@@ -251,22 +273,19 @@ def train_all_splits(
     if splits is None:
         splits = list(ctx_dict.keys())  # e.g. ['short','long']
 
-    # 用于存储所有 split 的指标历史
-    all_metrics = {'loss': [], 'mse': [], 'mae': []}
+    # 用于保存每个 split 的指标
+    metrics_dict = {}
 
     # 2) 对每个 split 调用 train_on_split
     for split in splits:
         ctx_arr = ctx_dict[split]['patches']  # 注意这里要取 'patches' 键
         tgt_arr = tgt_dict[split]['patches']  # 注意这里要取 'patches' 键
-        
         metrics = train_on_split(split, ctx_arr, tgt_arr, **train_kwargs)
-        
-        # 累加每个 split 的指标
-        for k in all_metrics:
-            all_metrics[k].extend(metrics[k])
+        metrics_dict[split] = metrics
 
-    # 3) 绘制所有 split 的对比图
-    plot_training_metrics(all_metrics, 'all')
+    # 3) 保存对比图
+    plot_path = "/content/drive/MyDrive/Colab Notebooks/plots/training_comparison.png"
+    plot_comparison_metrics(metrics_dict, plot_path)
 
 if __name__ == '__main__':
     # 路径按需修改
