@@ -2,9 +2,10 @@ import os
 from preprocess.base_patch_extractor import BasePatchExtractor, PATCH_SIZE, WINDOW_SIZE
 
 # Global parameters for window generation
-SHORT_RANGE = (0.86, 1.0)  # 短期patches的范围 (start_ratio, end_ratio)
-LONG_RANGE = (0.70, 1.0)   # 长期patches的范围 (start_ratio, end_ratio)
-LONG_STEP = 0.15          # 长期patches的步长比例
+SHORT_RANGE = (0.96, 0.98)  # 短期patches的范围 (start_ratio, end_ratio)
+LONG_RANGE = (0.8, 1.0)   # 长期patches的范围 (start_ratio, end_ratio)
+LONG_STEP = 0.02          # 长期patches的步长比例
+STRIDE = 12
 
 class PseudoFuturePatchExtractor(BasePatchExtractor):
     def __init__(self, csv_path, output_dir):
@@ -28,7 +29,7 @@ class PseudoFuturePatchExtractor(BasePatchExtractor):
         current_idx = start_idx
         while current_idx + PATCH_SIZE + WINDOW_SIZE <= end_idx:
             windows.append(current_idx)
-            current_idx += PATCH_SIZE
+            current_idx += PATCH_SIZE+STRIDE
         
         return windows
     
@@ -59,8 +60,8 @@ class PseudoFuturePatchExtractor(BasePatchExtractor):
         return "pseudo_future_patches"
 
 if __name__ == "__main__":
-    csv_path = "/Users/echohe/Desktop/Research/spark/data/GEM1h.csv"
-    output_dir = "data/pseudo_future_patches"
+    csv_path = "/Users/echohe/Desktop/Research/spark/data/SWAT/SWAT_train.npy"
+    output_dir = "data/SWAT/pseudo_future_patches"
     
     extractor = PseudoFuturePatchExtractor(
         csv_path=csv_path,
