@@ -1,58 +1,68 @@
-# predictor.py
 import torch
 import torch.nn as nn
-from einops import rearrange
+from transformers import PatchTSTConfig, PatchTSTForPrediction
 
-class Predictor(nn.Module):
-    def __init__(self, latent_dim=128, num_future=3, num_layers=2, nhead=4, dropout=0.1):
+class JEPPredictor(nn.Module):
+    def __init__(
+        self,
+        latent_dim: int,
+        context_length: int,
+        prediction_length: int,
+        num_layers: int = 4,
+        num_heads: int = 4,
+        ffn_dim: int = None,
+    ):
+        """
+        latent_dim:        Encoder 输出的 latent 向量维度 D
+        context_length:    上下文 patch 数 N_ctx
+        prediction_length: 目标 patch 数 N_tgt
+        num_layers:        Transformer 层数
+        num_heads:         Attention 头数
+        ffn_dim:           Feed-forward 维度 (默认 4*D)
+        """
         super().__init__()
-        self.num_future = num_future
+        if ffn_dim is None:
+            ffn_dim = latent_dim * 4
 
-        # positional encoding + transformer
-        self.pos_encoder = PositionalEncoding(latent_dim, dropout)
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model=latent_dim, nhead=nhead, dropout=dropout, batch_first=True),
-            num_layers=num_layers
+        # 1) 准备 Config
+        config = PatchTSTConfig(
+            num_input_channels   = latent_dim,
+            context_length       = context_length,
+            prediction_length    = prediction_length,
+            patch_length         = 1,
+            patch_stride         = 1,
+            d_model              = latent_dim,
+            num_hidden_layers    = num_layers,
+            num_attention_heads  = num_heads,
+            ffn_dim              = ffn_dim,
+            do_mask_input        = False,
         )
 
-        # learnable future positional embeddings
-        self.future_pos_embed = nn.Parameter(torch.randn(num_future, latent_dim))  # [N_future, D]
+        # 2) 实例化预测模型
+        self.model = PatchTSTForPrediction(config)
 
-        # concatenate context summary with each future step's pos_embed
-        self.out_proj = nn.Sequential(
-            nn.Linear(2 * latent_dim, latent_dim),
-            nn.ReLU(),
-            nn.Linear(latent_dim, latent_dim)
+        # 3) 跳过默认的 patch 切分＋embedding 层
+        #    直接把 (B, N_ctx, D) 当作 Transformer 输入
+        #    注意：不同版本下层名称可能略有差异，请根据 print(self.model) 调整
+        self.model.to_patch_embedding = nn.Identity()
+        self.model.positional_encoding = nn.Identity()
+
+    def forward(
+        self,
+        ctx_latents: torch.Tensor,
+        tgt_latents: torch.Tensor = None
+    ):
+        """
+        ctx_latents: [B, N_ctx, D]  已完成切 patch + Encoder 的上下文序列
+        tgt_latents: [B, N_tgt, D]  （训练时）对应的目标序列，用于计算 loss
+                     (推理时可留 None)
+        """
+        outputs = self.model(
+            past_values   = ctx_latents,
+            future_values = tgt_latents
         )
+        preds = outputs.prediction_outputs  # [B, N_tgt, D]
 
-    def forward(self, s_ctx):  # s_ctx: [B, N_ctx, D]
-        B = s_ctx.size(0)
-        h = self.transformer(self.pos_encoder(s_ctx))  # [B, N_ctx, D]
-        summary = h.mean(dim=1)                        # [B, D]
-
-        # each future step's positional encoding: copy to batch
-        future_embed = self.future_pos_embed.unsqueeze(0).expand(B, -1, -1)  # [B, N_future, D]
-        summary_expand = summary.unsqueeze(1).expand(-1, self.num_future, -1)  # [B, N_future, D]
-
-        # concatenate [summary || pos_embed] → [B, N_future, 2D]
-        concat = torch.cat([summary_expand, future_embed], dim=-1)  # [B, N_future, 2D]
-
-        pred = self.out_proj(concat)  # [B, N_future, D]
-        return pred
-
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=500):
-        super().__init__()
-        self.dropout = nn.Dropout(dropout)
-        pe = torch.zeros(max_len, d_model)  # [T, D]
-        position = torch.arange(0, max_len).unsqueeze(1)  # [T, 1]
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-torch.log(torch.tensor(10000.0)) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)  # even
-        pe[:, 1::2] = torch.cos(position * div_term)  # odd
-        pe = pe.unsqueeze(0)  # [1, T, D]
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        x = x + self.pe[:, :x.size(1), :]
-        return self.dropout(x)
+        if tgt_latents is not None:
+            return preds, outputs.loss      # (predictions, scalar loss)
+        return preds                         # inference 模式，只返回预测值

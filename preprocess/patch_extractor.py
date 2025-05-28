@@ -2,9 +2,10 @@ import os
 from preprocess.base_patch_extractor import BasePatchExtractor, PATCH_SIZE, WINDOW_SIZE
 
 # Global parameters for window generation
-SHORT_RANGE = (0.6, 0.85)  # 短期patches的范围 (start_ratio, end_ratio)
-LONG_RANGE = (0.0, 0.85)    # 长期patches的范围 (start_ratio, end_ratio)
-LONG_STEP = 0.15          # 长期patches的步长比例
+SHORT_RANGE = (0.90, 0.95)  # 短期patches的范围 (start_ratio, end_ratio)
+LONG_RANGE = (0.0, 0.80)    # 长期patches的范围 (start_ratio, end_ratio)
+LONG_STEP = 0.02         # 长期patches的步长比例
+STRIDE = 10
 
 class QuantilePatchExtractor(BasePatchExtractor):
     def __init__(self, csv_path, output_dir):
@@ -24,11 +25,11 @@ class QuantilePatchExtractor(BasePatchExtractor):
         start_idx = int(length * SHORT_RANGE[0])
         end_idx = int(length * SHORT_RANGE[1])
         
-        # 在指定范围内连续取patches
+        # 在指定范围内连续取patches and gap is stride
         current_idx = start_idx
         while current_idx + PATCH_SIZE + WINDOW_SIZE <= end_idx:
             windows.append(current_idx)
-            current_idx += PATCH_SIZE
+            current_idx += PATCH_SIZE+STRIDE
         
         return windows
     
@@ -59,8 +60,12 @@ class QuantilePatchExtractor(BasePatchExtractor):
         return "patches"
 
 if __name__ == "__main__":
-    csv_path = "/Users/echohe/Desktop/Research/spark/data/GEM1h.csv"
-    output_dir = "data/patches"
+    # 修正输入文件路径
+    csv_path = "data/SWAT/SWAT_train.npy"  # 更新为正确的路径
+    output_dir = "data/SWAT/patches"
+    
+    # 确保输出目录存在
+    os.makedirs(output_dir, exist_ok=True)
     
     extractor = QuantilePatchExtractor(
         csv_path=csv_path,

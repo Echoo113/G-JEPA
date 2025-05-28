@@ -20,12 +20,25 @@ class DatasetProcessor:
         
     def load_and_clean_data(self):
         """
-        Load the CSV file and perform initial cleaning
-        - Remove Time column
+        Load the data file and perform initial cleaning
+        - For .npy files: load directly using np.load
+        - For .csv files: load using pd.read_csv
+        - Remove Time column if exists
         - Convert units (remove µA)
         - Convert to float
         """
-        self.df = pd.read_csv(self.csv_path)
+        if self.csv_path.endswith('.npy'):
+            data = np.load(self.csv_path)
+            self.df = pd.DataFrame(data)
+        else:
+            try:
+                self.df = pd.read_csv(self.csv_path, encoding='utf-8')
+            except UnicodeDecodeError:
+                try:
+                    self.df = pd.read_csv(self.csv_path, encoding='latin1')
+                except:
+                    self.df = pd.read_csv(self.csv_path, encoding='gbk')
+        
         if 'Time' in self.df.columns:
             self.df = self.df.drop(columns=["Time"])
         
@@ -39,23 +52,33 @@ class DatasetProcessor:
     def group_columns_by_prefix(self):
         """
         Group columns by their prefix (u1, u2, etc.)
+        If no prefix pattern is found, treat all columns as one group
         Returns a dictionary where key is prefix and value is the group DataFrame
         """
         if self.df is None:
             self.load_and_clean_data()
             
         prefix_dict = {}
-        for col in self.df.columns:
-            m = re.match(r"u(\d)\d+", col)
-            if m:
-                prefix = f"u{m.group(1)}"  # take only the first digit
-                if prefix not in prefix_dict:
-                    prefix_dict[prefix] = []
-                prefix_dict[prefix].append(col)
+        has_prefix = False
         
-        # Convert to DataFrame
-        for prefix in prefix_dict:
-            prefix_dict[prefix] = self.df[prefix_dict[prefix]]
+        # Try to find columns with prefix pattern
+        for col in self.df.columns:
+            if isinstance(col, str):  # Only process string column names
+                m = re.match(r"u(\d)\d+", col)
+                if m:
+                    has_prefix = True
+                    prefix = f"u{m.group(1)}"  # take only the first digit
+                    if prefix not in prefix_dict:
+                        prefix_dict[prefix] = []
+                    prefix_dict[prefix].append(col)
+        
+        # If no prefix pattern found, treat all columns as one group
+        if not has_prefix:
+            prefix_dict = {"all": self.df}
+        else:
+            # Convert to DataFrame for each prefix group
+            for prefix in prefix_dict:
+                prefix_dict[prefix] = self.df[prefix_dict[prefix]]
         
         self.groups = prefix_dict
         return prefix_dict

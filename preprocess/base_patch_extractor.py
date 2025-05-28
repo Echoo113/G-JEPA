@@ -6,10 +6,6 @@ from data_processing.dataset_processor import DatasetProcessor
 PATCH_SIZE = 30
 WINDOW_SIZE = 5
 
-# Global parameters for window generation
-SHORT_QUANTILE_START = 0.9  # 短期patches的起始位置
-SHORT_PATCHES = 2          # 短期patches的数量
-LONG_PATCHES = 2          # 长期patches的数量
 
 class BasePatchExtractor:
     def __init__(self, csv_path, output_dir):
