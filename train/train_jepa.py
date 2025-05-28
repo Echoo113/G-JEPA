@@ -65,27 +65,31 @@ def plot_training_metrics(metrics_history, split_name, save_dir='/content/drive/
     os.makedirs(save_dir, exist_ok=True)
     
     # 创建单个图表
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(12, 8))
     
     # 在同一个图表中绘制三个指标
     epochs = range(1, len(metrics_history['loss']) + 1)
-    plt.plot(epochs, metrics_history['loss'], label='Loss', color='blue', linewidth=2)
-    plt.plot(epochs, metrics_history['mse'], label='MSE', color='orange', linewidth=2)
-    plt.plot(epochs, metrics_history['mae'], label='MAE', color='green', linewidth=2)
+    
+    # 为每个指标使用不同的颜色和线型
+    plt.plot(epochs, metrics_history['loss'], label=f'{split_name} Loss', 
+             color='blue', linewidth=2, linestyle='-')
+    plt.plot(epochs, metrics_history['mse'], label=f'{split_name} MSE', 
+             color='orange', linewidth=2, linestyle='-')
+    plt.plot(epochs, metrics_history['mae'], label=f'{split_name} MAE', 
+             color='green', linewidth=2, linestyle='-')
     
     # 设置图表属性
-    plt.title(f'{split_name} - Training Metrics', fontsize=14, pad=15)
+    plt.title('Training Metrics Comparison', fontsize=14, pad=15)
     plt.xlabel('Epoch', fontsize=12)
     plt.ylabel('Value', fontsize=12)
     plt.grid(True, linestyle='--', alpha=0.7)
-    plt.legend(fontsize=10)
+    plt.legend(fontsize=10, loc='upper right')
     
     # 调整布局
     plt.tight_layout()
     
     # 保存图表到 Google Drive
-
-    save_path = os.path.join(save_dir, f'{split_name}_training_metrics.png')
+    save_path = os.path.join(save_dir, 'training_metrics_comparison.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
     
@@ -221,8 +225,7 @@ def train_on_split(
             f"MAE: {avg_mae:.4f}"
         )
 
-    # 训练结束后绘制指标曲线
-    plot_training_metrics(metrics_history, split_name)
+    return metrics_history
 
 def train_all_splits(
     ctx_pkl, tgt_pkl,
@@ -248,11 +251,18 @@ def train_all_splits(
     if splits is None:
         splits = list(ctx_dict.keys())  # e.g. ['short','long']
 
+    # 用于存储所有 split 的指标历史
+    all_metrics = {}
+
     # 2) 对每个 split 调用 train_on_split
     for split in splits:
         ctx_arr = ctx_dict[split]['patches']  # 注意这里要取 'patches' 键
         tgt_arr = tgt_dict[split]['patches']  # 注意这里要取 'patches' 键
-        train_on_split(split, ctx_arr, tgt_arr, **train_kwargs)
+        metrics = train_on_split(split, ctx_arr, tgt_arr, **train_kwargs)
+        all_metrics[split] = metrics
+
+    # 3) 绘制所有 split 的对比图
+    plot_training_metrics(all_metrics, 'all')
 
 if __name__ == '__main__':
     # 路径按需修改
