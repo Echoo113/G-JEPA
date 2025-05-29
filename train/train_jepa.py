@@ -4,10 +4,15 @@ import numpy as np
 from jepa.encoder import MyTimeSeriesEncoder, prepare_batch_from_np
 from jepa.predictor import JEPPredictor
 
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 # ========= 超参数设置 =========
 BATCH_SIZE = 2
 LATENT_DIM = 64
-EPOCHS     = 3
+EPOCHS     = 30
 PATCH_FILE = "data/SOLAR/patches/solar_patches.npz"  # 你之前存好的 npz 文件
 
 # ========= 工具函数 =========
