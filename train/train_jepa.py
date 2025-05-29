@@ -1,13 +1,18 @@
+
+import sys
+import os
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+
 import torch
 import torch.nn as nn
 import numpy as np
 from jepa.encoder import MyTimeSeriesEncoder, prepare_batch_from_np
 from jepa.predictor import JEPPredictor
 
-
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
 
 # ========= 超参数设置 =========
 BATCH_SIZE = 2
