@@ -18,7 +18,7 @@ from jepa.encoder import ContextEncoder, TargetEncoder
 from jepa.predictor import JEPPredictor
 
 # 全局超参：碗数
-NUM_BOWLS = 500
+NUM_BOWLS = 1000
 
 def get_device():
     """检测是否有 CUDA 可用，如果有就用 CUDA，否则用 CPU"""
@@ -135,7 +135,7 @@ def train_on_split(
     tgt_arr,
     batch_size=16,
     lr=1e-4,
-    epochs=20,
+    epochs=30,
     device=None  # 如果为 None，则自动检测
 ):
     """在单个 split（short 或 long）上跑训练"""
@@ -310,6 +310,6 @@ if __name__ == '__main__':
         ctx_pkl, tgt_pkl,
         batch_size=16,
         lr=1e-4,
-        epochs=20,
+        epochs=30,
         device=None  # 自动检测设备
     ) 

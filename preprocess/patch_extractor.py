@@ -4,7 +4,7 @@ from preprocess.base_patch_extractor import BasePatchExtractor, PATCH_SIZE, WIND
 # Global parameters for window generation
 SHORT_RANGE = (0.90, 0.95)  # 短期patches的范围 (start_ratio, end_ratio)
 LONG_RANGE = (0.0, 0.80)    # 长期patches的范围 (start_ratio, end_ratio)
-LONG_STEP = 0.02         # 长期patches的步长比例
+LONG_STEP = 0.01         # 长期patches的步长比例
 STRIDE = 10
 
 class QuantilePatchExtractor(BasePatchExtractor):

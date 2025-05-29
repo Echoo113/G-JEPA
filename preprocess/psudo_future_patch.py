@@ -4,8 +4,8 @@ from preprocess.base_patch_extractor import BasePatchExtractor, PATCH_SIZE, WIND
 # Global parameters for window generation
 SHORT_RANGE = (0.96, 0.98)  # 短期patches的范围 (start_ratio, end_ratio)
 LONG_RANGE = (0.8, 1.0)   # 长期patches的范围 (start_ratio, end_ratio)
-LONG_STEP = 0.02          # 长期patches的步长比例
-STRIDE = 12
+LONG_STEP = 0.01          # 长期patches的步长比例
+STRIDE = 15
 
 class PseudoFuturePatchExtractor(BasePatchExtractor):
     def __init__(self, csv_path, output_dir):
