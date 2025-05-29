@@ -1,0 +1,4 @@
+| Dataset | Split | Latent Dim | Context Len | Pred Len | Final MSE  | Final MAE  |
+| ------- | ----- | ---------- | ----------- | -------- | ---------- | ---------- |
+| SWAT    | short | 16         | 4           | 1        | **0.0003** | **0.0076** |
+| SWAT    | long  | 16         | 4           | 1        | **0.0002** | **0.0073** | 

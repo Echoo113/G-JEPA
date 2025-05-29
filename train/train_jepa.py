@@ -1,315 +1,146 @@
-import os
-import pickle
 import torch
+import torch.nn as nn
 import numpy as np
-import sys
-from pathlib import Path
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-from datetime import datetime
-
-# 添加项目根目录到 Python 路径
-project_root = str(Path(__file__).parent.parent)
-if project_root not in sys.path:
-    sys.path.append(project_root)
-
-from torch.utils.data import Dataset, DataLoader
-from jepa.encoder import ContextEncoder, TargetEncoder
+from jepa.encoder import MyTimeSeriesEncoder, prepare_batch_from_np
 from jepa.predictor import JEPPredictor
 
-# 全局超参：碗数
-NUM_BOWLS = 1000
+# ========= 超参数设置 =========
+BATCH_SIZE = 2
+LATENT_DIM = 64
+EPOCHS     = 3
+PATCH_FILE = "data/SOLAR/patches/solar_patches.npz"  # 你之前存好的 npz 文件
 
-def get_device():
-    """检测是否有 CUDA 可用，如果有就用 CUDA，否则用 CPU"""
-    if torch.cuda.is_available():
-        print("Using CUDA")
-        return 'cuda'
-    else:
-        print("CUDA not available, using CPU")
-        return 'cpu'
+# ========= 工具函数 =========
+def prepare_batched_tensor(np_array: np.ndarray, batch_size: int) -> torch.Tensor:
+    """
+    把 numpy 的 patch 数据变成 (B, N, T, F) 的 Tensor 输入 Encoder
+    - 例如输入 shape = (172, 30, 137)，batch_size = 4
+    - 输出 shape = (4, 43, 30, 137)
+    """
+    total, T, F = np_array.shape
+    N = total // batch_size
+    usable = batch_size * N
+    return torch.tensor(np_array[:usable], dtype=torch.float).view(batch_size, N, T, F)
 
-class ArrayPatchDataset(Dataset):
-    def __init__(self, ctx_list, tgt_list):
-        assert len(ctx_list) == len(tgt_list)
-        self.ctx = ctx_list
-        self.tgt = tgt_list
+def compute_metrics(pred: torch.Tensor, target: torch.Tensor) -> dict:
+    """计算 MSE 和 MAE"""
+    mse = nn.MSELoss()(pred, target)
+    mae = nn.L1Loss()(pred, target)
+    return {'mse': mse.item(), 'mae': mae.item()}
 
-    def __len__(self):
-        return len(self.ctx)
+# ========= Step 1: 加载 patch 数据 =========
+print("\n[Step 1] Loading patch data...")
+npz = np.load(PATCH_FILE)
+ctx_long_np = npz['long_term_context']
+fut_long_np = npz['long_term_future']
+ctx_short_np = npz['short_term_context']
+fut_short_np = npz['short_term_future']
 
-    def __getitem__(self, idx):
-        # 先拿出来
-        ctx = self.ctx[idx]
-        tgt = self.tgt[idx]
+# 准备 batched tensors
+ctx_long_batch = prepare_batched_tensor(ctx_long_np, BATCH_SIZE)
+fut_long_batch = prepare_batched_tensor(fut_long_np, BATCH_SIZE)
+ctx_short_batch = prepare_batched_tensor(ctx_short_np, BATCH_SIZE)
+fut_short_batch = prepare_batched_tensor(fut_short_np, BATCH_SIZE)
 
-        # 如果是 numpy array，就用 from_numpy；如果已经是 Tensor，就直接转 float
-        if isinstance(ctx, np.ndarray):
-            ctx = torch.from_numpy(ctx).float()
-        elif isinstance(ctx, torch.Tensor):
-            ctx = ctx.float()
-        else:
-            raise TypeError(f"Unsupported type for ctx: {type(ctx)}")
+# ========= Step 2: 初始化模型 =========
+encoder = MyTimeSeriesEncoder(
+    patch_length=30,
+    num_vars=137,
+    latent_dim=LATENT_DIM,
+    num_layers=2,
+    num_attention_heads=2,
+)
 
-        if isinstance(tgt, np.ndarray):
-            tgt = torch.from_numpy(tgt).float()
-        elif isinstance(tgt, torch.Tensor):
-            tgt = tgt.float()
-        else:
-            raise TypeError(f"Unsupported type for tgt: {type(tgt)}")
+# 初始化两个 predictor
+predictor_long = JEPPredictor(
+    latent_dim=LATENT_DIM,
+    context_length=ctx_long_batch.shape[1],
+    prediction_length=fut_long_batch.shape[1],
+    num_layers=4,
+    num_heads=4
+)
 
-        return {'context_patches': ctx, 'target_patches': tgt}
+predictor_short = JEPPredictor(
+    latent_dim=LATENT_DIM,
+    context_length=ctx_short_batch.shape[1],
+    prediction_length=fut_short_batch.shape[1],
+    num_layers=4,
+    num_heads=4
+)
 
-def plot_training_metrics(metrics_history, split_name, save_dir='/content/drive/MyDrive/Colab Notebooks/plots'):
-    """绘制训练指标的历史曲线"""
-    os.makedirs(save_dir, exist_ok=True)
+print(f"\n[Debug] Model configurations:")
+print(f"- Encoder latent dim: {LATENT_DIM}")
+print(f"- Long-term context/prediction: {ctx_long_batch.shape[1]}/{fut_long_batch.shape[1]}")
+print(f"- Short-term context/prediction: {ctx_short_batch.shape[1]}/{fut_short_batch.shape[1]}")
+
+# 分别创建优化器
+optimizer_long = torch.optim.Adam(
+    list(encoder.parameters()) + list(predictor_long.parameters()),
+    lr=1e-3
+)
+
+optimizer_short = torch.optim.Adam(
+    list(encoder.parameters()) + list(predictor_short.parameters()),
+    lr=1e-3
+)
+
+# ========= Step 3: 训练长期预测 =========
+print("\n[Step 3] Training long-term prediction...")
+
+for epoch in range(1, EPOCHS + 1):
+    encoder.train()
+    predictor_long.train()
+    optimizer_long.zero_grad()
+
+    ctx_L = encoder(ctx_long_batch)
+    tgt_L = encoder(fut_long_batch)
+    pred_L, loss_L = predictor_long(ctx_L, tgt_L)
     
-    # 创建单个图表
-    plt.figure(figsize=(12, 8))
+    loss_L.backward()
+    optimizer_long.step()
     
-    # 在同一个图表中绘制三个指标
-    epochs = range(1, len(metrics_history['loss']) + 1)
+    # 计算长期预测的指标
+    metrics_L = compute_metrics(pred_L, tgt_L)
     
-    # 为每个指标使用不同的颜色和线型
-    plt.plot(epochs, metrics_history['loss'], label='Loss', 
-             color='blue', linewidth=2, linestyle='-')
-    plt.plot(epochs, metrics_history['mse'], label='MSE', 
-             color='orange', linewidth=2, linestyle='-')
-    plt.plot(epochs, metrics_history['mae'], label='MAE', 
-             color='green', linewidth=2, linestyle='-')
+    # 打印训练进度
+    print(f"[Long-term Epoch {epoch:02d}] Loss: {loss_L.item():.4f}, MSE: {metrics_L['mse']:.4f}, MAE: {metrics_L['mae']:.4f}")
+
+    # 在第一个epoch打印shape信息
+    if epoch == 1:
+        print(f"\n[Debug] Long-term shapes:")
+        print(f"- Context: {ctx_L.shape}")
+        print(f"- Target: {tgt_L.shape}")
+        print(f"- Prediction: {pred_L.shape}")
+
+print("\n[Long-term training completed]")
+
+# ========= Step 4: 训练短期预测 =========
+print("\n[Step 4] Training short-term prediction...")
+
+for epoch in range(1, EPOCHS + 1):
+    encoder.train()
+    predictor_short.train()
+    optimizer_short.zero_grad()
+
+    ctx_S = encoder(ctx_short_batch)
+    tgt_S = encoder(fut_short_batch)
+    pred_S, loss_S = predictor_short(ctx_S, tgt_S)
     
-    # 设置图表属性
-    plt.title('Training Metrics Comparison', fontsize=14, pad=15)
-    plt.xlabel('Epoch', fontsize=12)
-    plt.ylabel('Value', fontsize=12)
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.legend(fontsize=10, loc='upper right')
+    loss_S.backward()
+    optimizer_short.step()
     
-    # 调整布局
-    plt.tight_layout()
-    plt.show()
-    # 保存图表到 Google Drive
-    save_path = os.path.join(save_dir, 'training_metrics_comparison.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print(f"Training metrics plot saved to Google Drive: {save_path}")
+    # 计算短期预测的指标
+    metrics_S = compute_metrics(pred_S, tgt_S)
 
-def plot_comparison_metrics(metrics_dict, save_path):
-    """将 short 和 long 的 Loss/MSE/MAE 都画在一张图上，6条线都可区分"""
-    plt.figure(figsize=(12, 8))
-    epochs = range(1, len(next(iter(metrics_dict.values()))['loss']) + 1)
+    # 打印训练进度
+    print(f"[Short-term Epoch {epoch:02d}] Loss: {loss_S.item():.4f}, MSE: {metrics_S['mse']:.4f}, MAE: {metrics_S['mae']:.4f}")
 
-    style_map = {
-        'short-Loss':  {'color': 'blue',   'linestyle': '-',  'marker': 'o'},
-        'short-MSE':   {'color': 'orange', 'linestyle': '--', 'marker': 's'},
-        'short-MAE':   {'color': 'green',  'linestyle': ':',  'marker': '^'},
-        'long-Loss':   {'color': 'red',    'linestyle': '-',  'marker': 'o'},
-        'long-MSE':    {'color': 'purple', 'linestyle': '--', 'marker': 's'},
-        'long-MAE':    {'color': 'brown',  'linestyle': ':',  'marker': '^'},
-    }
+    # 在第一个epoch打印shape信息
+    if epoch == 1:
+        print(f"\n[Debug] Short-term shapes:")
+        print(f"- Context: {ctx_S.shape}")
+        print(f"- Target: {tgt_S.shape}")
+        print(f"- Prediction: {pred_S.shape}")
 
-    for split in metrics_dict:
-        plt.plot(epochs, metrics_dict[split]['loss'], label=f'{split}-Loss', 
-                 **style_map[f'{split}-Loss'])
-        plt.plot(epochs, metrics_dict[split]['mse'], label=f'{split}-MSE', 
-                 **style_map[f'{split}-MSE'])
-        plt.plot(epochs, metrics_dict[split]['mae'], label=f'{split}-MAE', 
-                 **style_map[f'{split}-MAE'])
-
-    plt.title('Training Metrics (Short vs Long)', fontsize=14)
-    plt.xlabel('Epoch')
-    plt.ylabel('Value')
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.legend(fontsize=12)
-    plt.tight_layout()
-
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"Training comparison plot saved: {save_path}")
-
-def train_on_split(
-    split_name: str,
-    ctx_arr,
-    tgt_arr,
-    batch_size=16,
-    lr=1e-4,
-    epochs=30,
-    device=None  # 如果为 None，则自动检测
-):
-    """在单个 split（short 或 long）上跑训练"""
-    if device is None:
-        device = get_device()
-        
-    print(f"\n=== Training split: {split_name} ===")
-    print(f"Context array type: {type(ctx_arr)}")
-    print(f"Target array type: {type(tgt_arr)}")
-    
-    # 确保数据是 numpy 数组
-    if isinstance(ctx_arr, list):
-        ctx_arr = np.array(ctx_arr)
-    if isinstance(tgt_arr, list):
-        tgt_arr = np.array(tgt_arr)
-    
-    # 1) 计算每碗要装多少片 patch
-    N_ctx, N_tgt = len(ctx_arr), len(tgt_arr)
-    ctx_per_bowl = N_ctx // NUM_BOWLS
-    tgt_per_bowl = N_tgt // NUM_BOWLS
-    
-    print(f"Original shapes - Context: {ctx_arr.shape}, Target: {tgt_arr.shape}")
-    print(f"Patches per bowl - Context: {ctx_per_bowl}, Target: {tgt_per_bowl}")
-    
-    # 2) 丢掉余下的，保留整除部分
-    ctx_used = ctx_arr[: ctx_per_bowl * NUM_BOWLS]
-    tgt_used = tgt_arr[: tgt_per_bowl * NUM_BOWLS]
-    
-    # 3) 重塑成 [NUM_BOWLS, patches_per_bowl, patch_len]
-    ctx_bowls = ctx_used.reshape(NUM_BOWLS, ctx_per_bowl, -1)
-    tgt_bowls = tgt_used.reshape(NUM_BOWLS, tgt_per_bowl, -1)
-    
-    print(f"After reshaping - Context: {ctx_bowls.shape}, Target: {tgt_bowls.shape}")
-    
-    ds = ArrayPatchDataset(ctx_bowls, tgt_bowls)
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=4)
-
-    # 从第一个样本推断维度
-    sample_ctx = ds[0]['context_patches']
-    N_ctx, feat_dim = sample_ctx.shape
-    sample_tgt = ds[0]['target_patches']
-    N_tgt, _ = sample_tgt.shape
-    latent_dim = 16  # 或者你想用的其他值
-
-    # new model instances per split
-    enc_ctx   = ContextEncoder(input_dim=feat_dim, latent_dim=latent_dim).to(device)
-    enc_tgt   = TargetEncoder(input_dim=feat_dim, latent_dim=latent_dim).to(device)
-    predictor = JEPPredictor(
-        latent_dim        = latent_dim,
-        context_length    = ctx_per_bowl,  # 使用每碗的 patch 数作为上下文长度
-        prediction_length = tgt_per_bowl,  # 使用每碗的 patch 数作为预测长度
-    ).to(device)
-
-    opt = torch.optim.Adam(
-        list(enc_ctx.parameters()) +
-        list(enc_tgt.parameters()) +
-        list(predictor.parameters()),
-        lr=lr
-    )
-
-    # 保存到各自子目录
-    ckpt_dir = os.path.join('checkpoints', split_name)
-    os.makedirs(ckpt_dir, exist_ok=True)
-
-    # 用于记录训练指标
-    metrics_history = {
-        'loss': [],
-        'mse': [],
-        'mae': []
-    }
-
-    for epoch in range(1, epochs+1):
-        enc_ctx.train(); enc_tgt.train(); predictor.train()
-        total_loss = 0.0
-        total_mse  = 0.0
-        total_mae  = 0.0
-
-        for batch in loader:
-            ctx_raw = batch['context_patches'].to(device)
-            tgt_raw = batch['target_patches'].to(device)
-
-            # 编码成 latent
-            ctx_lat = enc_ctx(ctx_raw)   # [B, N_tgt, D]
-            tgt_lat = enc_tgt(tgt_raw)   # [B, N_tgt, D]
-
-            # 预测 & 损失
-            preds, loss = predictor(ctx_lat, tgt_lat)
-
-            # 1) 反向 + 更新
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-
-            # 2) 累加 loss（原来有的）
-            bsz = ctx_raw.size(0)
-            total_loss += loss.item() * bsz
-
-            # 3) 计算这 batch 的 MSE & MAE
-            #    preds 和 tgt_lat 都是 [B, N, D]
-            mse_batch = F.mse_loss(preds, tgt_lat, reduction='mean').item()
-            mae_batch = F.l1_loss(preds, tgt_lat, reduction='mean').item()
-
-            total_mse += mse_batch * bsz
-            total_mae += mae_batch * bsz
-
-        # 平均到每个样本
-        n_samples = len(ds)
-        avg_loss = total_loss / n_samples
-        avg_mse  = total_mse  / n_samples
-        avg_mae  = total_mae  / n_samples
-
-        # 记录指标
-        metrics_history['loss'].append(avg_loss)
-        metrics_history['mse'].append(avg_mse)
-        metrics_history['mae'].append(avg_mae)
-
-        print(
-            f"[{split_name}] Epoch {epoch:02d} — "
-            f"avg loss: {avg_loss:.4f}  "
-            f"MSE: {avg_mse:.4f}  "
-            f"MAE: {avg_mae:.4f}"
-        )
-
-    return metrics_history
-
-def train_all_splits(
-    ctx_pkl, tgt_pkl,
-    splits=None,
-    **train_kwargs
-):
-    """一次性对所有 split 依次训练"""
-    # 1) 加载两个 dict
-    with open(ctx_pkl, 'rb') as f:
-        ctx_dict = pickle.load(f)
-    with open(tgt_pkl, 'rb') as f:
-        tgt_dict = pickle.load(f)
-
-    print("\nData structure info:")
-    print("Context dict keys:", list(ctx_dict.keys()))
-    print("Target dict keys:", list(tgt_dict.keys()))
-    
-    for split in ctx_dict:
-        print(f"\n{split} split info:")
-        print("Context:", ctx_dict[split].keys())
-        print("Target:", tgt_dict[split].keys())
-
-    if splits is None:
-        splits = list(ctx_dict.keys())  # e.g. ['short','long']
-
-    # 用于保存每个 split 的指标
-    metrics_dict = {}
-
-    # 2) 对每个 split 调用 train_on_split
-    for split in splits:
-        ctx_arr = ctx_dict[split]['patches']  # 注意这里要取 'patches' 键
-        tgt_arr = tgt_dict[split]['patches']  # 注意这里要取 'patches' 键
-        metrics = train_on_split(split, ctx_arr, tgt_arr, **train_kwargs)
-        metrics_dict[split] = metrics
-    
-    
-
-    # 3) 保存对比图
-    plot_path = "/content/drive/MyDrive/Colab Notebooks/plots/training_comparison.png"
-    plot_comparison_metrics(metrics_dict, plot_path)
-
-if __name__ == '__main__':
-    # 路径按需修改
-    ctx_pkl = 'data/SWAT/patches/all_patches.pkl'
-    tgt_pkl = 'data/SWAT/pseudo_future_patches/all_pseudo_future_patches.pkl'
-
-    train_all_splits(
-        ctx_pkl, tgt_pkl,
-        batch_size=16,
-        lr=1e-4,
-        epochs=30,
-        device=None  # 自动检测设备
-    ) 
+print("\n[Short-term training completed]")
+print("\n[All training completed]")
