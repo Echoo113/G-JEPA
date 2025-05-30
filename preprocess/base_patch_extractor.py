@@ -3,11 +3,11 @@ from preprocess.datatool import DataTool
 import os
 import json
 
-# ====== 全局参数 ======
-PATCH_SIZE        = 30     # 每个 patch 的时间步长
-STRIDE            = 10     # 滑动步长
-CONTEXT_RATIO     = 0.8    # 前 80% patch 作为 context
-LONG_TERM_RATIO   = 0.05   #1/ratio, similar to stride
+# ====== Global Parameters ======
+PATCH_SIZE        = 30     # Time steps per patch
+STRIDE            = 10     # Sliding window stride
+CONTEXT_RATIO     = 0.8    # First 80% of patches as context
+LONG_TERM_RATIO   = 0.05   # 1/ratio, similar to stride
 DEFAULT_FILENAME  = "data/SOLAR/solar_10_minutes_dataset.csv"
 SHORT_TERM_RATIO  = 0.3
 
@@ -41,12 +41,12 @@ class PatchExtractor:
 
     def _select_short_term(self, patches: np.ndarray, tail: bool) -> np.ndarray:
         """
-        从 patches 中按 index 直接选取前/后 short_term_ratio 比例的短期 patches
+        Select short-term patches from the beginning or end based on ratio
         Args:
             patches: np.ndarray, shape=(M, patch_size, C)
-            tail: True=取尾部比例, False=取头部比例
+            tail: True=select from end, False=select from beginning
         Returns:
-            np.ndarray 短期 patches
+            np.ndarray of short-term patches
         """
         M = patches.shape[0]
         k = max(1, int(M * self.short_term_ratio))
@@ -54,16 +54,16 @@ class PatchExtractor:
 
     def store_patches(self, patches_dict: dict, save_path: str, compressed: bool = True):
         """
-        将所有patches存储到一个.npz文件中
+        Store all patches in a .npz file
         Args:
-            patches_dict: 包含所有patches的字典
-            save_path: 保存路径，例如 'data/patches/solar_patches.npz'
-            compressed: 是否使用压缩存储
+            patches_dict: Dictionary containing all patches
+            save_path: Save path, e.g., 'data/patches/solar_patches.npz'
+            compressed: Whether to use compression
         """
-        # 确保目录存在
+        # Ensure directory exists
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
-        # 保存参数到单独的json文件
+        # Save parameters to a separate json file
         params = {
             'patch_size': self.patch_size,
             'stride': self.stride,
@@ -75,7 +75,7 @@ class PatchExtractor:
         with open(params_path, 'w') as f:
             json.dump(params, f, indent=4)
         
-        # 保存patches
+        # Save patches
         if compressed:
             np.savez_compressed(save_path, **patches_dict)
         else:
@@ -85,9 +85,9 @@ class PatchExtractor:
     @staticmethod
     def load_patches(load_path: str) -> tuple:
         """
-        从.npz文件加载所有patches
+        Load all patches from .npz file
         Args:
-            load_path: 加载路径，例如 'data/patches/solar_patches.npz'
+            load_path: Load path, e.g., 'data/patches/solar_patches.npz'
         Returns:
             tuple: (long_term_context, long_term_future, short_term_context, short_term_future)
         """
@@ -112,19 +112,19 @@ class PatchExtractor:
 
     def verify_saved_patches(self, load_path: str):
         """
-        验证保存的patches和参数
+        Verify saved patches and parameters
         Args:
-            load_path: 加载路径，例如 'data/patches/solar_patches.npz'
+            load_path: Load path, e.g., 'data/patches/solar_patches.npz'
         """
-        # 加载patches
+        # Load patches
         data = np.load(load_path)
         
-        # 打印shapes
+        # Print shapes
         print("\nPatch shapes:")
         for key in ['long_term_context', 'long_term_future', 'short_term_context', 'short_term_future']:
             print(f"{key}: {data[key].shape}")
         
-        # 加载并打印参数
+        # Load and print parameters
         params_path = load_path.replace('.npz', '_params.json')
         with open(params_path, 'r') as f:
             params = json.load(f)
@@ -134,28 +134,28 @@ class PatchExtractor:
             print(f"{key}: {value}")
 
     def extract_patches(self, debug: bool = False) -> tuple:
-        # 1) 加载并标准化数据
+        # 1) Load and normalize data
         data = self.data_tool.get_data()  # (T, C)
         T, C = data.shape
 
-        # 2) 切出多变量 patches
+        # 2) Extract multivariate patches
         all_patches = []
         for start in range(0, T - self.patch_size + 1, self.stride):
             all_patches.append(data[start:start + self.patch_size])
         all_patches = np.stack(all_patches)  # (N, patch_size, C)
 
-        # 3) 划分 context & pseudo-future
+        # 3) Split into context & pseudo-future
         context_patches, future_patches = self._split_context_future(all_patches)
 
-        # 4) 长期 sampling
+        # 4) Long-term sampling
         long_term_context = self._select_long_term(context_patches)
         long_term_future  = self._select_long_term(future_patches)
 
-        # 5) 短期 selection: context 取尾部, future 取头部
+        # 5) Short-term selection: context from end, future from beginning
         short_term_context = self._select_short_term(context_patches, tail=True)
         short_term_future  = self._select_short_term(future_patches, tail=False)
 
-        # 6) Debug 信息
+        # 6) Debug information
         if debug:
             patches_dict = {
                 'long_term_context': long_term_context,
@@ -176,7 +176,7 @@ if __name__ == "__main__":
     extractor = PatchExtractor()
     ltc, ltf, stc, stf = extractor.extract_patches(debug=True)
     
-    # 存储patches
+    # Store patches
     patches_dict = {
         'long_term_context': ltc,
         'long_term_future': ltf,
@@ -186,5 +186,5 @@ if __name__ == "__main__":
     save_path = 'data/SOLAR/patches/solar_patches.npz'
     extractor.store_patches(patches_dict, save_path, compressed=True)
     
-    # 验证保存的数据
+    # Verify saved data
     extractor.verify_saved_patches(save_path)

@@ -1,4 +1,3 @@
-
 import sys
 import os
 
@@ -14,18 +13,18 @@ from jepa.encoder import MyTimeSeriesEncoder, prepare_batch_from_np
 from jepa.predictor import JEPPredictor
 
 
-# ========= 超参数设置 =========
+# ========= settings =========
 BATCH_SIZE = 2
 LATENT_DIM = 64
 EPOCHS     = 30
-PATCH_FILE = "data/SOLAR/patches/solar_patches.npz"  # 你之前存好的 npz 文件
+PATCH_FILE = "data/SOLAR/patches/solar_patches.npz"  
 
-# ========= 工具函数 =========
+# ========= tools =========
 def prepare_batched_tensor(np_array: np.ndarray, batch_size: int) -> torch.Tensor:
     """
-    把 numpy 的 patch 数据变成 (B, N, T, F) 的 Tensor 输入 Encoder
-    - 例如输入 shape = (172, 30, 137)，batch_size = 4
-    - 输出 shape = (4, 43, 30, 137)
+    Convert numpy patch data into (B, N, T, F) Tensor for Encoder input
+    - For example, input shape = (172, 30, 137), batch_size = 4
+    - Output shape = (4, 43, 30, 137)
     """
     total, T, F = np_array.shape
     N = total // batch_size
@@ -33,12 +32,12 @@ def prepare_batched_tensor(np_array: np.ndarray, batch_size: int) -> torch.Tenso
     return torch.tensor(np_array[:usable], dtype=torch.float).view(batch_size, N, T, F)
 
 def compute_metrics(pred: torch.Tensor, target: torch.Tensor) -> dict:
-    """计算 MSE 和 MAE"""
+    """Calculate MSE and MAE"""
     mse = nn.MSELoss()(pred, target)
     mae = nn.L1Loss()(pred, target)
     return {'mse': mse.item(), 'mae': mae.item()}
 
-# ========= Step 1: 加载 patch 数据 =========
+# ========= Step 1: load patch data =========
 print("\n[Step 1] Loading patch data...")
 npz = np.load(PATCH_FILE)
 ctx_long_np = npz['long_term_context']
@@ -46,13 +45,13 @@ fut_long_np = npz['long_term_future']
 ctx_short_np = npz['short_term_context']
 fut_short_np = npz['short_term_future']
 
-# 准备 batched tensors
+# Prepare batched tensors
 ctx_long_batch = prepare_batched_tensor(ctx_long_np, BATCH_SIZE)
 fut_long_batch = prepare_batched_tensor(fut_long_np, BATCH_SIZE)
 ctx_short_batch = prepare_batched_tensor(ctx_short_np, BATCH_SIZE)
 fut_short_batch = prepare_batched_tensor(fut_short_np, BATCH_SIZE)
 
-# ========= Step 2: 初始化模型 =========
+# ========= Step 2: initialize model =========
 encoder = MyTimeSeriesEncoder(
     patch_length=30,
     num_vars=137,
@@ -61,7 +60,7 @@ encoder = MyTimeSeriesEncoder(
     num_attention_heads=2,
 )
 
-# 初始化两个 predictor
+# Initialize two predictors
 predictor_long = JEPPredictor(
     latent_dim=LATENT_DIM,
     context_length=ctx_long_batch.shape[1],
@@ -83,7 +82,7 @@ print(f"- Encoder latent dim: {LATENT_DIM}")
 print(f"- Long-term context/prediction: {ctx_long_batch.shape[1]}/{fut_long_batch.shape[1]}")
 print(f"- Short-term context/prediction: {ctx_short_batch.shape[1]}/{fut_short_batch.shape[1]}")
 
-# 分别创建优化器
+# Initialize two optimizers
 optimizer_long = torch.optim.Adam(
     list(encoder.parameters()) + list(predictor_long.parameters()),
     lr=1e-3
@@ -94,7 +93,7 @@ optimizer_short = torch.optim.Adam(
     lr=1e-3
 )
 
-# ========= Step 3: 训练长期预测 =========
+# ========= Step 3: train long-term prediction =========
 print("\n[Step 3] Training long-term prediction...")
 
 for epoch in range(1, EPOCHS + 1):
@@ -109,13 +108,13 @@ for epoch in range(1, EPOCHS + 1):
     loss_L.backward()
     optimizer_long.step()
     
-    # 计算长期预测的指标
+    # Calculate long-term prediction metrics
     metrics_L = compute_metrics(pred_L, tgt_L)
     
-    # 打印训练进度
+    # Print training progress
     print(f"[Long-term Epoch {epoch:02d}] Loss: {loss_L.item():.4f}, MSE: {metrics_L['mse']:.4f}, MAE: {metrics_L['mae']:.4f}")
 
-    # 在第一个epoch打印shape信息
+    # Print shape information in the first epoch
     if epoch == 1:
         print(f"\n[Debug] Long-term shapes:")
         print(f"- Context: {ctx_L.shape}")
@@ -124,7 +123,7 @@ for epoch in range(1, EPOCHS + 1):
 
 print("\n[Long-term training completed]")
 
-# ========= Step 4: 训练短期预测 =========
+# ========= Step 4: train short-term prediction =========
 print("\n[Step 4] Training short-term prediction...")
 
 for epoch in range(1, EPOCHS + 1):
@@ -139,13 +138,13 @@ for epoch in range(1, EPOCHS + 1):
     loss_S.backward()
     optimizer_short.step()
     
-    # 计算短期预测的指标
+    # Calculate short-term prediction metrics
     metrics_S = compute_metrics(pred_S, tgt_S)
 
-    # 打印训练进度
+    # Print training progress
     print(f"[Short-term Epoch {epoch:02d}] Loss: {loss_S.item():.4f}, MSE: {metrics_S['mse']:.4f}, MAE: {metrics_S['mae']:.4f}")
 
-    # 在第一个epoch打印shape信息
+    # Print shape information in the first epoch
     if epoch == 1:
         print(f"\n[Debug] Short-term shapes:")
         print(f"- Context: {ctx_S.shape}")
