@@ -40,8 +40,75 @@ if series_data:
     df = pd.DataFrame(series_data)
     df = df.transpose()
     df.columns = [f'T{i+1}' for i in range(len(series_data))]
-    df.to_csv('data/SOLAR/solar_10_minutes_dataset.csv', index=False)
-    print("转换完成！已保存为 'solar_10_minutes_dataset.csv'")
+    
+    # 添加数据统计信息
+    print("\n=== 数据统计信息 ===")
     print(f"数据形状: {df.shape} (行数: 时间点数, 列数: 变量数)")
+    
+    # 计算每个时间序列的统计信息
+    stats = pd.DataFrame({
+        'mean': df.mean(),
+        'std': df.std(),
+        'min': df.min(),
+        'max': df.max(),
+        'median': df.median(),
+        'missing_values': df.isna().sum()
+    })
+    
+    print("\n=== 每个时间序列的统计信息 ===")
+    print(stats)
+    
+    # 计算全局统计信息
+    print("\n=== 全局统计信息 ===")
+    print(f"所有数据的均值: {df.values.mean():.4f}")
+    print(f"所有数据的标准差: {df.values.std():.4f}")
+    print(f"所有数据的最小值: {df.values.min():.4f}")
+    print(f"所有数据的最大值: {df.values.max():.4f}")
+    print(f"所有数据的中位数: {np.median(df.values):.4f}")
+    print(f"缺失值总数: {df.isna().sum().sum()}")
+   
+    # 保存原始数据
+    df.to_csv('data/SOLAR/solar_10_minutes_dataset.csv', index=False)
+    print("原始数据已保存为 'solar_10_minutes_dataset.csv'")
+    
 else:
     print("错误：文件中没有找到有效数据。")
+
+def get_data(self, normalize: bool = True):
+    """
+    获取处理后的数据
+    
+    Args:
+        normalize (bool): 是否对数据进行归一化处理，默认为 True
+        
+    Returns:
+        pd.DataFrame: 处理后的数据，如果 normalize=True 则返回归一化后的数据，否则返回原始数据
+    """
+    self.load()
+    
+    if normalize:
+        # 对每个时间序列进行归一化
+        for col in self.data.columns:
+            series = self.data[col]
+            mean = series.mean()
+            std = series.std()
+            if std != 0:  # 避免除以零
+                self.data[col] = (series - mean) / std
+            else:
+                self.data[col] = series - mean
+                
+        # 打印归一化后的统计信息
+        print("\n归一化后的数据统计信息:")
+        print(self.data.describe())
+        
+        # 保存归一化后的数据
+        self.data.to_csv('data/SOLAR/solar_data_normalized.csv', index=False)
+        print("\n归一化后的数据已保存到 'data/SOLAR/solar_data_normalized.csv'")
+        
+        return self.data
+    else:
+        # 保存原始数据
+        self.data.to_csv('data/SOLAR/solar_data_original.csv', index=False)
+        print("\n原始数据已保存到 'data/SOLAR/solar_data_original.csv'")
+        
+        return self.data
