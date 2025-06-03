@@ -20,7 +20,7 @@ LATENT_DIM = 64
 EPOCHS     = 100
 PATCH_FILE = "data/SOLAR/patches/solar_train.npz"
 VAL_FILE   = "data/SOLAR/patches/solar_val.npz"
-EARLY_STOPPING_PATIENCE = 10  # Number of epochs to wait before early stopping
+EARLY_STOPPING_PATIENCE = 15  # Number of epochs to wait before early stopping
 EARLY_STOPPING_DELTA = 0.0001  # Minimum change in monitored value to qualify as an improvement
 
 # ========= tools =========
@@ -312,13 +312,16 @@ print("Best models saved to 'model/jepa_models.pt'")
 print("\n[Step 6] Plotting metrics with two subplots...")
 
 fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-epochs = range(1, EPOCHS + 1)
+
+# Use actual number of epochs for plotting
+long_term_epochs = range(1, len(long_term_history['train_mse']) + 1)
+short_term_epochs = range(1, len(short_term_history['train_mse']) + 1)
 
 # Short-term subplot (left)
-axes[0].plot(epochs, short_term_history['train_mse'], label='Train MSE', color='orange', linestyle='-')
-axes[0].plot(epochs, short_term_history['val_mse'], label='Val MSE', color='orange', linestyle='--')
-axes[0].plot(epochs, short_term_history['train_mae'], label='Train MAE', color='red', linestyle='-')
-axes[0].plot(epochs, short_term_history['val_mae'], label='Val MAE', color='red', linestyle='--')
+axes[0].plot(short_term_epochs, short_term_history['train_mse'], label='Train MSE', color='orange', linestyle='-')
+axes[0].plot(short_term_epochs, short_term_history['val_mse'], label='Val MSE', color='orange', linestyle='--')
+axes[0].plot(short_term_epochs, short_term_history['train_mae'], label='Train MAE', color='red', linestyle='-')
+axes[0].plot(short_term_epochs, short_term_history['val_mae'], label='Val MAE', color='red', linestyle='--')
 axes[0].set_title('Short-term Metrics')
 axes[0].set_xlabel('Epoch')
 axes[0].set_ylabel('Value')
@@ -326,10 +329,10 @@ axes[0].legend()
 axes[0].grid(True)
 
 # Long-term subplot (right)
-axes[1].plot(epochs, long_term_history['train_mse'], label='Train MSE', color='b', linestyle='-')
-axes[1].plot(epochs, long_term_history['val_mse'], label='Val MSE', color='b', linestyle='--')
-axes[1].plot(epochs, long_term_history['train_mae'], label='Train MAE', color='c', linestyle='-')
-axes[1].plot(epochs, long_term_history['val_mae'], label='Val MAE', color='c', linestyle='--')
+axes[1].plot(long_term_epochs, long_term_history['train_mse'], label='Train MSE', color='b', linestyle='-')
+axes[1].plot(long_term_epochs, long_term_history['val_mse'], label='Val MSE', color='b', linestyle='--')
+axes[1].plot(long_term_epochs, long_term_history['train_mae'], label='Train MAE', color='c', linestyle='-')
+axes[1].plot(long_term_epochs, long_term_history['val_mae'], label='Val MAE', color='c', linestyle='--')
 axes[1].set_title('Long-term Metrics')
 axes[1].set_xlabel('Epoch')
 axes[1].set_ylabel('Value')
