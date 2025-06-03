@@ -213,7 +213,7 @@ for epoch in range(1, EPOCHS + 1):
         else:
             patience_counter += 1
 
-    print(f"[Epoch {epoch:02d}] Train MSE={loss_tr.item():.4f} | Val MSE={loss_va.item():.4f}")
+    print(f"[Epoch {epoch:02d}] Train MSE={loss_tr.item():.6f} | Val MSE={loss_va.item():.6f}")
 
     if patience_counter >= EARLY_STOPPING_PATIENCE:
         print(f"→ Early stopping at epoch {epoch}")
@@ -233,7 +233,7 @@ with torch.no_grad():
     # 计算 MSE/MAE
     metrics = compute_metrics(pred_test_flat, y_test_flat)
     print("Long-term predictor → ForecastHead 预测结果：")
-    print(f"  MSE = {metrics['mse']:.4f}, MAE = {metrics['mae']:.4f}")
+    print(f"  MSE = {metrics['mse']:.6f}, MAE = {metrics['mae']:.6f}")
 
 
 # ========= Step 9: 可视化 ForecastHead 的训练曲线 =========

@@ -21,7 +21,7 @@ EPOCHS     = 100
 PATCH_FILE = "data/SOLAR/patches/solar_train.npz"
 VAL_FILE   = "data/SOLAR/patches/solar_val.npz"
 EARLY_STOPPING_PATIENCE = 15  # Number of epochs to wait before early stopping
-EARLY_STOPPING_DELTA = 0.0001  # Minimum change in monitored value to qualify as an improvement
+EARLY_STOPPING_DELTA = 0.00005  # Minimum change in monitored value to qualify as an improvement
 
 # ========= tools =========
 def prepare_batched_tensor(np_array: np.ndarray, batch_size: int) -> torch.Tensor:
@@ -170,8 +170,8 @@ for epoch in range(1, EPOCHS + 1):
             patience_counter += 1
 
     # Print training progress
-    print(f"[Long-term Epoch {epoch:02d}] Loss: {loss_L.item():.4f}, MSE: {metrics_L['mse']:.4f}, MAE: {metrics_L['mae']:.4f}")
-    print(f"                     Val   - MSE: {val_metrics_L['mse']:.4f}, MAE: {val_metrics_L['mae']:.4f}")
+    print(f"[Long-term Epoch {epoch:02d}] Loss: {loss_L.item():.6f}, MSE: {metrics_L['mse']:.6f}, MAE: {metrics_L['mae']:.6f}")
+    print(f"                     Val   - MSE: {val_metrics_L['mse']:.6f}, MAE: {val_metrics_L['mae']:.6f}")
 
     # Early stopping
     if patience_counter >= EARLY_STOPPING_PATIENCE:
@@ -248,8 +248,8 @@ for epoch in range(1, EPOCHS + 1):
             patience_counter += 1
 
     # Print training progress
-    print(f"[Short-term Epoch {epoch:02d}] Loss: {loss_S.item():.4f}, MSE: {metrics_S['mse']:.4f}, MAE: {metrics_S['mae']:.4f}")
-    print(f"                     Val   - MSE: {val_metrics_S['mse']:.4f}, MAE: {val_metrics_S['mae']:.4f}")
+    print(f"[Short-term Epoch {epoch:02d}] Loss: {loss_S.item():.6f}, MSE: {metrics_S['mse']:.6f}, MAE: {metrics_S['mae']:.6f}")
+    print(f"                     Val   - MSE: {val_metrics_S['mse']:.6f}, MAE: {val_metrics_S['mae']:.6f}")
 
     # Early stopping
     if patience_counter >= EARLY_STOPPING_PATIENCE:
