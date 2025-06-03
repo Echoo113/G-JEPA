@@ -11,6 +11,7 @@ class DataTool:
         self.debug = debug
 
     def load(self):
+        """Load raw data without standardization"""
         if self.path.endswith(".npy"):
             self.data = np.load(self.path)
         elif self.path.endswith(".csv"):
@@ -21,6 +22,7 @@ class DataTool:
         return self.data
 
     def standardize(self):
+        """Standardize the data using StandardScaler"""
         if self.data is None:
             self.load()
 
@@ -33,6 +35,7 @@ class DataTool:
         return self.scaled_data
 
     def get_data(self):
+        """Get standardized data"""
         if self.scaled_data is None:
             self.load()
             return self.standardize()

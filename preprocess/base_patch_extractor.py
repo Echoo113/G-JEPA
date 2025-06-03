@@ -19,14 +19,14 @@ class PatchExtractor:
         patch_size: int = PATCH_SIZE,
         stride: int = STRIDE,
         long_term_ratio: float = LONG_TERM_RATIO,
-        long_term_quantile: float = LONG_TERM_QUANTILE
+        long_term_quantile: float = LONG_TERM_QUANTILE,
+        normalize: bool = False
     ):
         self.data_tool        = DataTool(filename, debug=False)
         self.patch_size       = patch_size
         self.stride           = stride
-
         self.long_term_ratio  = long_term_ratio
-
+        self.normalize        = normalize
 
     def _split_context_future_disjoint(self, patches: np.ndarray) -> tuple:
         """
@@ -147,7 +147,10 @@ class PatchExtractor:
 
     def extract_patches(self, debug: bool = False) -> tuple:
         # 1) Load and normalize data
-        data = self.data_tool.get_data()  # (T, C)
+        if self.normalize:
+            data = self.data_tool.get_data()  # (T, C)
+        else:
+            data = self.data_tool.load()  # (T, C)
         T, C = data.shape
 
         # 2) Extract multivariate patches
@@ -155,6 +158,8 @@ class PatchExtractor:
         for start in range(0, T - self.patch_size + 1, self.stride):
             all_patches.append(data[start:start + self.patch_size])
         all_patches = np.stack(all_patches)  # (N, patch_size, C)
+        #print first patch first 5 rows and 10 columns
+        print(all_patches[0][:5, :10])
 
         # 2.5) Only use first 80% of patches for training
         train_size = int(len(all_patches) * TRAIN_RANGE)
@@ -162,6 +167,9 @@ class PatchExtractor:
 
         # 3) Split into context & future using disjoint rule
         train_context_patches, train_future_patches = self._split_context_future_disjoint(train_patches)
+        #print one patch first 5 rows and 10 columns
+        print(train_context_patches[0][:5, :10])
+        print(train_future_patches[0][:5, :10])
 
         # 4) Long-term sampling: apply ratio to each part separately
         train_long_term_context = self._select_long_term(train_context_patches)  # 75% * ratio
@@ -249,10 +257,13 @@ class PatchExtractor:
         return test_long_term_context, test_long_term_future
 
 if __name__ == "__main__":
-    extractor = PatchExtractor()
+    extractor = PatchExtractor(normalize=False)  # 使用未归一化数据
     
     # 1) Extract all patches first
-    data = extractor.data_tool.get_data()
+    if extractor.normalize:
+        data = extractor.data_tool.get_data()
+    else:
+        data = extractor.data_tool.load()
     T, C = data.shape
     all_patches = []
     for start in range(0, T - PATCH_SIZE + 1, STRIDE):
@@ -278,6 +289,8 @@ if __name__ == "__main__":
     }
     validation_path = 'data/SOLAR/patches/solar_val.npz'
     extractor.store_patches(val_dict, validation_path, compressed=True)
+    #print one patch first 5 rows and 10 columns
+    print(val_dict['long_term_context'][0][:5, :10])
 
     # 4) Extract test patches
     test_context, test_future = extractor.extract_test_patches(all_patches, debug=True)
