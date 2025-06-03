@@ -9,7 +9,7 @@ STRIDE            = 10     # Sliding window stride
 LONG_TERM_RATIO   = 0.4   # Take  10% of total patches
 DEFAULT_FILENAME  = "data/SOLAR/solar_10_minutes_dataset.csv"
 LONG_TERM_QUANTILE = 0.75   # 75% context, 25% future
-TRAIN_RANGE       = 0.8    # Use first 80% of patches for training
+TRAIN_RANGE       = 0.7    # Use first 80% of patches for training
 VALIDATION_RANGE  = 0.1    # Use last 10% of patches for validation
 
 class PatchExtractor:

@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 *.so
 .Python
+env/
 build/
 develop-eggs/
 dist/
@@ -22,7 +23,6 @@ wheels/
 
 # Virtual Environment
 venv/
-env/
 ENV/
 
 # IDE
@@ -31,8 +31,30 @@ ENV/
 *.swp
 *.swo
 
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Model files and data
+model/
+*.pt
+*.pth
+*.h5
+*.npz
+
+# Logs and plots
+*.log
+*.png
+*.jpg
+*.jpeg
+*.gif
+
 # OS
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
 
 # Large files

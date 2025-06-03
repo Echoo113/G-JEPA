@@ -15,11 +15,13 @@ import matplotlib.pyplot as plt
 
 
 # ========= settings =========
-BATCH_SIZE = 2
+BATCH_SIZE = 4
 LATENT_DIM = 64
-EPOCHS     = 200
+EPOCHS     = 100
 PATCH_FILE = "data/SOLAR/patches/solar_train.npz"
 VAL_FILE   = "data/SOLAR/patches/solar_val.npz"
+EARLY_STOPPING_PATIENCE = 10  # Number of epochs to wait before early stopping
+EARLY_STOPPING_DELTA = 0.0001  # Minimum change in monitored value to qualify as an improvement
 
 # ========= tools =========
 def prepare_batched_tensor(np_array: np.ndarray, batch_size: int) -> torch.Tensor:
@@ -117,22 +119,18 @@ long_term_history = {
 }
 
 best_val_mse = float('inf')
+patience_counter = 0
+best_model_state = None
+
 for epoch in range(1, EPOCHS + 1):
     # Training
     encoder.train()
     predictor_long.train()
     optimizer_long.zero_grad()
 
-    
-
     ctx_L = encoder(ctx_long_batch)
     tgt_L = encoder(fut_long_batch)
-    
-   
-    
     pred_L, loss_L = predictor_long(ctx_L, tgt_L)
-    
-    
     
     loss_L.backward()
     optimizer_long.step()
@@ -148,24 +146,37 @@ for epoch in range(1, EPOCHS + 1):
     encoder.eval()
     predictor_long.eval()
     with torch.no_grad():
-        
-        
         val_ctx_L = encoder(val_ctx)
         val_tgt_L = encoder(val_fut)
-       
         val_pred_L, _ = predictor_long(val_ctx_L, val_tgt_L)
-        
-       
-        
         val_metrics_L = compute_metrics(val_pred_L, val_tgt_L)
         
         # Record validation metrics
         long_term_history['val_mse'].append(val_metrics_L['mse'])
         long_term_history['val_mae'].append(val_metrics_L['mae'])
 
+        # Early stopping check
+        if val_metrics_L['mse'] < best_val_mse - EARLY_STOPPING_DELTA:
+            best_val_mse = val_metrics_L['mse']
+            patience_counter = 0
+            # Save best model state
+            best_model_state = {
+                'encoder_state_dict': encoder.state_dict(),
+                'predictor_long_state_dict': predictor_long.state_dict(),
+                'epoch': epoch,
+                'val_mse': best_val_mse
+            }
+        else:
+            patience_counter += 1
+
     # Print training progress
     print(f"[Long-term Epoch {epoch:02d}] Loss: {loss_L.item():.4f}, MSE: {metrics_L['mse']:.4f}, MAE: {metrics_L['mae']:.4f}")
     print(f"                     Val   - MSE: {val_metrics_L['mse']:.4f}, MAE: {val_metrics_L['mae']:.4f}")
+
+    # Early stopping
+    if patience_counter >= EARLY_STOPPING_PATIENCE:
+        print(f"\nEarly stopping triggered after {epoch} epochs")
+        break
 
     # Print shape information in the first epoch
     if epoch == 1:
@@ -186,6 +197,9 @@ short_term_history = {
 }
 
 best_val_mse = float('inf')
+patience_counter = 0
+best_short_model_state = None
+
 for epoch in range(1, EPOCHS + 1):
     # Training
     encoder.train()
@@ -210,24 +224,37 @@ for epoch in range(1, EPOCHS + 1):
     encoder.eval()
     predictor_short.eval()
     with torch.no_grad():
-        
         val_ctx_S = encoder(val_ctx)
         val_tgt_S = encoder(val_fut)
-        
-       
-        
         val_pred_S, _ = predictor_short(val_ctx_S, val_tgt_S)
-        
-        
         val_metrics_S = compute_metrics(val_pred_S, val_tgt_S)
         
         # Record validation metrics
         short_term_history['val_mse'].append(val_metrics_S['mse'])
         short_term_history['val_mae'].append(val_metrics_S['mae'])
 
+        # Early stopping check
+        if val_metrics_S['mse'] < best_val_mse - EARLY_STOPPING_DELTA:
+            best_val_mse = val_metrics_S['mse']
+            patience_counter = 0
+            # Save best model state
+            best_short_model_state = {
+                'encoder_state_dict': encoder.state_dict(),
+                'predictor_short_state_dict': predictor_short.state_dict(),
+                'epoch': epoch,
+                'val_mse': best_val_mse
+            }
+        else:
+            patience_counter += 1
+
     # Print training progress
     print(f"[Short-term Epoch {epoch:02d}] Loss: {loss_S.item():.4f}, MSE: {metrics_S['mse']:.4f}, MAE: {metrics_S['mae']:.4f}")
     print(f"                     Val   - MSE: {val_metrics_S['mse']:.4f}, MAE: {val_metrics_S['mae']:.4f}")
+
+    # Early stopping
+    if patience_counter >= EARLY_STOPPING_PATIENCE:
+        print(f"\nEarly stopping triggered after {epoch} epochs")
+        break
 
     # Print shape information in the first epoch
     if epoch == 1:
@@ -239,8 +266,50 @@ for epoch in range(1, EPOCHS + 1):
 print("\n[Short-term training completed]")
 print("\n[All training completed]")
 
-# ========= Step 5: Plot metrics: two subplots in one figure =========
-print("\n[Step 5] Plotting metrics with two subplots...")
+# ========= Step 5: Save best models =========
+print("\n[Step 5] Saving best models...")
+
+# Create a directory for saving models if it doesn't exist
+os.makedirs('model', exist_ok=True)
+
+# Save the best models
+torch.save({
+    'encoder_state_dict': best_model_state['encoder_state_dict'],
+    'predictor_long_state_dict': best_model_state['predictor_long_state_dict'],
+    'predictor_short_state_dict': best_short_model_state['predictor_short_state_dict'],
+    'encoder_config': {
+        'patch_length': 30,
+        'num_vars': 137,
+        'latent_dim': LATENT_DIM,
+        'num_layers': 2,
+        'num_attention_heads': 2,
+    },
+    'predictor_long_config': {
+        'latent_dim': LATENT_DIM,
+        'context_length': ctx_long_batch.shape[1],
+        'prediction_length': fut_long_batch.shape[1],
+        'num_layers': 4,
+        'num_heads': 4
+    },
+    'predictor_short_config': {
+        'latent_dim': LATENT_DIM,
+        'context_length': ctx_short_batch.shape[1],
+        'prediction_length': fut_short_batch.shape[1],
+        'num_layers': 4,
+        'num_heads': 4
+    },
+    'training_info': {
+        'long_term_best_epoch': best_model_state['epoch'],
+        'long_term_best_val_mse': best_model_state['val_mse'],
+        'short_term_best_epoch': best_short_model_state['epoch'],
+        'short_term_best_val_mse': best_short_model_state['val_mse']
+    }
+}, 'model/jepa_models.pt')
+
+print("Best models saved to 'model/jepa_models.pt'")
+
+# ========= Step 6: Plot metrics: two subplots in one figure =========
+print("\n[Step 6] Plotting metrics with two subplots...")
 
 fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 epochs = range(1, EPOCHS + 1)
