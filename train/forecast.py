@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
+import pandas as pd
 from jepa.encoder import MyTimeSeriesEncoder
 from jepa.predictor import JEPPredictor
 
@@ -18,6 +19,7 @@ EARLY_STOPPING_DELTA    = 1e-4
 PATCH_FILE = "data/SOLAR/patches/solar_train.npz"
 VAL_FILE   = "data/SOLAR/patches/solar_val.npz"
 TEST_FILE  = "data/SOLAR/patches/solar_test.npz"
+STATS_FILE = "data/SOLAR/solar_data_statistics.csv"
 
 # 每个 patch 的时间步长和变量数
 PATCH_LENGTH = 30
@@ -42,6 +44,43 @@ def compute_metrics(pred: torch.Tensor, target: torch.Tensor) -> dict:
     mse = nn.MSELoss()(pred, target)
     mae = nn.L1Loss()(pred, target)
     return {'mse': mse.item(), 'mae': mae.item()}
+
+def load_statistics(stats_path: str) -> tuple:
+    """加载数据统计信息"""
+    stats_df = pd.read_csv(stats_path, index_col=0)
+    means = torch.tensor(stats_df["mean"].values, dtype=torch.float).view(1, 1, NUM_VARS)
+    stds = torch.tensor(stats_df["std"].values, dtype=torch.float).view(1, 1, NUM_VARS)
+    return means, stds
+
+def unnormalize(x_flat: torch.Tensor, means: torch.Tensor, stds: torch.Tensor) -> torch.Tensor:
+    """
+    还原预测值到原始尺度
+    Args:
+        x_flat: shape (B, 30*137) 的展平张量
+        means: shape (1, 1, 137) 的均值
+        stds: shape (1, 1, 137) 的标准差
+    Returns:
+        shape (B, 30*137) 的还原后的展平张量
+    """
+    B = x_flat.shape[0]
+    x_reshaped = x_flat.view(B, PATCH_LENGTH, NUM_VARS)  # (B, T, F)
+    x_restored = x_reshaped * stds + means
+    return x_restored.view(B, -1)  # (B, 30*137)
+
+def restore_and_evaluate(pred_flat: torch.Tensor, y_flat: torch.Tensor, stats_path: str) -> dict:
+    """
+    还原预测值和真实值到原始尺度，并计算指标
+    Args:
+        pred_flat: shape (B, 30*137) 的预测值
+        y_flat: shape (B, 30*137) 的真实值
+        stats_path: 统计信息文件路径
+    Returns:
+        包含原始尺度下 MSE 和 MAE 的字典
+    """
+    means, stds = load_statistics(stats_path)
+    y_true_restored = unnormalize(y_flat, means, stds)
+    y_pred_restored = unnormalize(pred_flat, means, stds)
+    return compute_metrics(y_pred_restored, y_true_restored)
 
 # ========= Step 1: 加载并冻结 encoder + predictor_short/predictor_long =========
 print("\n[Step 1] Loading pretrained JEPA models...")
@@ -228,12 +267,48 @@ print("[Step 7] Best ForecastHead loaded.")
 print("\n[Step 8] Evaluating on test set (long-term predictor) ...")
 forecast_head.eval()
 with torch.no_grad():
-    # 上面已经预计算好了 z_pred_test_full → z_test_flat
-    pred_test_flat = forecast_head(z_test_flat)  # [B*N_fut, 4110]
-    # 计算 MSE/MAE
-    metrics = compute_metrics(pred_test_flat, y_test_flat)
-    print("Long-term predictor → ForecastHead 预测结果：")
-    print(f"  MSE = {metrics['mse']:.6f}, MAE = {metrics['mae']:.6f}")
+    # Long-term predictor evaluation
+    z_ctx_test_long = encoder(ctx_long_test)
+    z_fut_test_long = encoder(fut_long_test)
+    z_pred_test_long, _ = predictor_long(z_ctx_test_long, z_fut_test_long)
+    
+    # Flatten tensors for ForecastHead
+    z_pred_test_long_flat = z_pred_test_long.view(-1, LATENT_DIM)  # [B*N, D]
+    y_test_flat = fut_long_test.view(-1, PATCH_LENGTH * NUM_VARS)  # [B*N, 4110]
+    
+    # Pass through ForecastHead
+    pred_test_flat_long = forecast_head(z_pred_test_long_flat)
+    
+    # Compute metrics in normalized space
+    metrics_long = compute_metrics(pred_test_flat_long, y_test_flat)
+    print("Long-term predictor → ForecastHead 预测结果 (归一化空间)：")
+    print(f"  MSE = {metrics_long['mse']:.6f}, MAE = {metrics_long['mae']:.6f}")
+    
+    # Compute metrics in original space
+    metrics_long_restored = restore_and_evaluate(pred_test_flat_long, y_test_flat, STATS_FILE)
+    print("Long-term predictor → ForecastHead 预测结果 (原始空间)：")
+    print(f"  MSE = {metrics_long_restored['mse']:.6f}, MAE = {metrics_long_restored['mae']:.6f}")
+
+    # Short-term predictor evaluation
+    z_ctx_test_short = encoder(ctx_long_test)
+    z_fut_test_short = encoder(fut_long_test)
+    z_pred_test_short, _ = predictor_short(z_ctx_test_short, z_fut_test_short)
+    
+    # Flatten tensors for ForecastHead
+    z_pred_test_short_flat = z_pred_test_short.view(-1, LATENT_DIM)  # [B*N, D]
+    
+    # Pass through ForecastHead
+    pred_test_flat_short = forecast_head(z_pred_test_short_flat)
+    
+    # Compute metrics in normalized space
+    metrics_short = compute_metrics(pred_test_flat_short, y_test_flat)
+    print("Short-term predictor → ForecastHead 预测结果 (归一化空间)：")
+    print(f"  MSE = {metrics_short['mse']:.6f}, MAE = {metrics_short['mae']:.6f}")
+    
+    # Compute metrics in original space
+    metrics_short_restored = restore_and_evaluate(pred_test_flat_short, y_test_flat, STATS_FILE)
+    print("Short-term predictor → ForecastHead 预测结果 (原始空间)：")
+    print(f"  MSE = {metrics_short_restored['mse']:.6f}, MAE = {metrics_short_restored['mae']:.6f}")
 
 
 # ========= Step 9: 可视化 ForecastHead 的训练曲线 =========

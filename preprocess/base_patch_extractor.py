@@ -20,12 +20,13 @@ class PatchExtractor:
         stride: int = STRIDE,
         long_term_ratio: float = LONG_TERM_RATIO,
         long_term_quantile: float = LONG_TERM_QUANTILE,
-        normalize: bool = False
+        normalize: bool = True
     ):
         self.data_tool        = DataTool(filename, debug=False)
         self.patch_size       = patch_size
         self.stride           = stride
         self.long_term_ratio  = long_term_ratio
+        self.long_term_quantile = long_term_quantile
         self.normalize        = normalize
 
     def _split_context_future_disjoint(self, patches: np.ndarray) -> tuple:
@@ -257,7 +258,7 @@ class PatchExtractor:
         return test_long_term_context, test_long_term_future
 
 if __name__ == "__main__":
-    extractor = PatchExtractor(normalize=False)  # 使用未归一化数据
+    extractor = PatchExtractor(normalize=True)  # 使用未归一化数据
     
     # 1) Extract all patches first
     if extractor.normalize:
