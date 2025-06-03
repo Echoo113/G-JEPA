@@ -11,12 +11,13 @@ import torch.nn as nn
 import numpy as np
 from jepa.encoder import MyTimeSeriesEncoder, prepare_batch_from_np
 from jepa.predictor import JEPPredictor
+import matplotlib.pyplot as plt
 
 
 # ========= settings =========
 BATCH_SIZE = 2
 LATENT_DIM = 64
-EPOCHS     = 30
+EPOCHS     = 200
 PATCH_FILE = "data/SOLAR/patches/solar_train.npz"
 VAL_FILE   = "data/SOLAR/patches/solar_val.npz"
 
@@ -139,6 +140,10 @@ for epoch in range(1, EPOCHS + 1):
     # Calculate training metrics
     metrics_L = compute_metrics(pred_L, tgt_L)
     
+    # Record metrics
+    long_term_history['train_mse'].append(metrics_L['mse'])
+    long_term_history['train_mae'].append(metrics_L['mae'])
+    
     # Validation
     encoder.eval()
     predictor_long.eval()
@@ -153,6 +158,10 @@ for epoch in range(1, EPOCHS + 1):
        
         
         val_metrics_L = compute_metrics(val_pred_L, val_tgt_L)
+        
+        # Record validation metrics
+        long_term_history['val_mse'].append(val_metrics_L['mse'])
+        long_term_history['val_mae'].append(val_metrics_L['mae'])
 
     # Print training progress
     print(f"[Long-term Epoch {epoch:02d}] Loss: {loss_L.item():.4f}, MSE: {metrics_L['mse']:.4f}, MAE: {metrics_L['mae']:.4f}")
@@ -192,6 +201,10 @@ for epoch in range(1, EPOCHS + 1):
     
     # Calculate training metrics
     metrics_S = compute_metrics(pred_S, tgt_S)
+    
+    # Record metrics
+    short_term_history['train_mse'].append(metrics_S['mse'])
+    short_term_history['train_mae'].append(metrics_S['mae'])
 
     # Validation
     encoder.eval()
@@ -207,6 +220,10 @@ for epoch in range(1, EPOCHS + 1):
         
         
         val_metrics_S = compute_metrics(val_pred_S, val_tgt_S)
+        
+        # Record validation metrics
+        short_term_history['val_mse'].append(val_metrics_S['mse'])
+        short_term_history['val_mae'].append(val_metrics_S['mae'])
 
     # Print training progress
     print(f"[Short-term Epoch {epoch:02d}] Loss: {loss_S.item():.4f}, MSE: {metrics_S['mse']:.4f}, MAE: {metrics_S['mae']:.4f}")
@@ -221,3 +238,36 @@ for epoch in range(1, EPOCHS + 1):
 
 print("\n[Short-term training completed]")
 print("\n[All training completed]")
+
+# ========= Step 5: Plot metrics: two subplots in one figure =========
+print("\n[Step 5] Plotting metrics with two subplots...")
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+epochs = range(1, EPOCHS + 1)
+
+# Short-term subplot (left)
+axes[0].plot(epochs, short_term_history['train_mse'], label='Train MSE', color='orange', linestyle='-')
+axes[0].plot(epochs, short_term_history['val_mse'], label='Val MSE', color='orange', linestyle='--')
+axes[0].plot(epochs, short_term_history['train_mae'], label='Train MAE', color='red', linestyle='-')
+axes[0].plot(epochs, short_term_history['val_mae'], label='Val MAE', color='red', linestyle='--')
+axes[0].set_title('Short-term Metrics')
+axes[0].set_xlabel('Epoch')
+axes[0].set_ylabel('Value')
+axes[0].legend()
+axes[0].grid(True)
+
+# Long-term subplot (right)
+axes[1].plot(epochs, long_term_history['train_mse'], label='Train MSE', color='b', linestyle='-')
+axes[1].plot(epochs, long_term_history['val_mse'], label='Val MSE', color='b', linestyle='--')
+axes[1].plot(epochs, long_term_history['train_mae'], label='Train MAE', color='c', linestyle='-')
+axes[1].plot(epochs, long_term_history['val_mae'], label='Val MAE', color='c', linestyle='--')
+axes[1].set_title('Long-term Metrics')
+axes[1].set_xlabel('Epoch')
+axes[1].set_ylabel('Value')
+axes[1].legend()
+axes[1].grid(True)
+
+fig.suptitle('Short-term and Long-term Metrics Overview', fontsize=16)
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+plt.savefig('metrics_overview.png', dpi=300, bbox_inches='tight')
+plt.show()
