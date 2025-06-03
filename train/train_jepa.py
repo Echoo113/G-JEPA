@@ -9,7 +9,6 @@ if project_root not in sys.path:
 import torch
 import torch.nn as nn
 import numpy as np
-import matplotlib.pyplot as plt
 from jepa.encoder import MyTimeSeriesEncoder, prepare_batch_from_np
 from jepa.predictor import JEPPredictor
 
@@ -17,9 +16,9 @@ from jepa.predictor import JEPPredictor
 # ========= settings =========
 BATCH_SIZE = 2
 LATENT_DIM = 64
-EPOCHS     = 100
+EPOCHS     = 30
 PATCH_FILE = "data/SOLAR/patches/solar_train.npz"
-VAL_FILE   = "data/SOLAR/patches/solar_val.npz"  # Add validation file path
+VAL_FILE   = "data/SOLAR/patches/solar_val.npz"
 
 # ========= tools =========
 def prepare_batched_tensor(np_array: np.ndarray, batch_size: int) -> torch.Tensor:
@@ -49,14 +48,21 @@ fut_short_np = npz['short_term_future']
 
 # Load validation data
 val_npz = np.load(VAL_FILE)
-val_ctx= prepare_batched_tensor(val_npz['long_term_context'], BATCH_SIZE)
-val_fut= prepare_batched_tensor(val_npz['long_term_future'], BATCH_SIZE)
+val_ctx = prepare_batched_tensor(val_npz['long_term_context'], BATCH_SIZE)
+val_fut = prepare_batched_tensor(val_npz['long_term_future'], BATCH_SIZE)
 
 # Prepare batched tensors
 ctx_long_batch = prepare_batched_tensor(ctx_long_np, BATCH_SIZE)
 fut_long_batch = prepare_batched_tensor(fut_long_np, BATCH_SIZE)
 ctx_short_batch = prepare_batched_tensor(ctx_short_np, BATCH_SIZE)
 fut_short_batch = prepare_batched_tensor(fut_short_np, BATCH_SIZE)
+
+print(f"\n[Debug] Long-term shapes:")
+print(f"- Context: {ctx_long_batch.shape}")
+print(f"- Target: {fut_long_batch.shape}")
+print(f"- Short-term shapes:")
+print(f"- Context: {ctx_short_batch.shape}")
+print(f"- Target: {fut_short_batch.shape}")
 
 # ========= Step 2: initialize model =========
 encoder = MyTimeSeriesEncoder(
@@ -116,9 +122,16 @@ for epoch in range(1, EPOCHS + 1):
     predictor_long.train()
     optimizer_long.zero_grad()
 
+    
+
     ctx_L = encoder(ctx_long_batch)
     tgt_L = encoder(fut_long_batch)
+    
+   
+    
     pred_L, loss_L = predictor_long(ctx_L, tgt_L)
+    
+    
     
     loss_L.backward()
     optimizer_long.step()
@@ -130,31 +143,20 @@ for epoch in range(1, EPOCHS + 1):
     encoder.eval()
     predictor_long.eval()
     with torch.no_grad():
+        
+        
         val_ctx_L = encoder(val_ctx)
         val_tgt_L = encoder(val_fut)
+       
         val_pred_L, _ = predictor_long(val_ctx_L, val_tgt_L)
+        
+       
+        
         val_metrics_L = compute_metrics(val_pred_L, val_tgt_L)
-    
-    # Record metrics
-    long_term_history['train_mse'].append(metrics_L['mse'])
-    long_term_history['train_mae'].append(metrics_L['mae'])
-    long_term_history['val_mse'].append(val_metrics_L['mse'])
-    long_term_history['val_mae'].append(val_metrics_L['mae'])
-    
-    # Print progress
-    print(f"[Long-term Epoch {epoch:02d}] Train - Loss: {loss_L.item():.4f}, MSE: {metrics_L['mse']:.4f}, MAE: {metrics_L['mae']:.4f}")
-    print(f"                    Val   - MSE: {val_metrics_L['mse']:.4f}, MAE: {val_metrics_L['mae']:.4f}")
-    
-    # Save best model
-    #comment out for now
-    #if val_metrics_L['mse'] < best_val_mse:
-    #    best_val_mse = val_metrics_L['mse']
-    #    torch.save({
-    #        'encoder_state_dict': encoder.state_dict(),
-    #        'predictor_state_dict': predictor_long.state_dict(),
-    #        'epoch': epoch,
-    #        'val_mse': best_val_mse
-    #    }, 'checkpoints/best_long_term_model.pt')
+
+    # Print training progress
+    print(f"[Long-term Epoch {epoch:02d}] Loss: {loss_L.item():.4f}, MSE: {metrics_L['mse']:.4f}, MAE: {metrics_L['mae']:.4f}")
+    print(f"                     Val   - MSE: {val_metrics_L['mse']:.4f}, MAE: {val_metrics_L['mae']:.4f}")
 
     # Print shape information in the first epoch
     if epoch == 1:
@@ -195,31 +197,20 @@ for epoch in range(1, EPOCHS + 1):
     encoder.eval()
     predictor_short.eval()
     with torch.no_grad():
-        val_ctx_S = encoder(val_ctx)  # Using long-term validation data
+        
+        val_ctx_S = encoder(val_ctx)
         val_tgt_S = encoder(val_fut)
+        
+       
+        
         val_pred_S, _ = predictor_short(val_ctx_S, val_tgt_S)
+        
+        
         val_metrics_S = compute_metrics(val_pred_S, val_tgt_S)
 
-    # Record metrics
-    short_term_history['train_mse'].append(metrics_S['mse'])
-    short_term_history['train_mae'].append(metrics_S['mae'])
-    short_term_history['val_mse'].append(val_metrics_S['mse'])
-    short_term_history['val_mae'].append(val_metrics_S['mae'])
-
-    # Print progress
-    print(f"[Short-term Epoch {epoch:02d}] Train - Loss: {loss_S.item():.4f}, MSE: {metrics_S['mse']:.4f}, MAE: {metrics_S['mae']:.4f}")
+    # Print training progress
+    print(f"[Short-term Epoch {epoch:02d}] Loss: {loss_S.item():.4f}, MSE: {metrics_S['mse']:.4f}, MAE: {metrics_S['mae']:.4f}")
     print(f"                     Val   - MSE: {val_metrics_S['mse']:.4f}, MAE: {val_metrics_S['mae']:.4f}")
-    
-    # Save best model
-    #comment out for now
-    #if val_metrics_S['mse'] < best_val_mse:
-    #    best_val_mse = val_metrics_S['mse']
-    #    torch.save({
-    #        'encoder_state_dict': encoder.state_dict(),
-    #        'predictor_state_dict': predictor_short.state_dict(),
-    #        'epoch': epoch,
-    #        'val_mse': best_val_mse
-    #    }, 'checkpoints/best_short_term_model.pt')
 
     # Print shape information in the first epoch
     if epoch == 1:
@@ -230,53 +221,3 @@ for epoch in range(1, EPOCHS + 1):
 
 print("\n[Short-term training completed]")
 print("\n[All training completed]")
-
-# ========= Step 5: Plot training curves =========
-print("\n[Step 5] Plotting training curves...")
-
-# Create figure with subplots
-fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-fig.suptitle('Training and Validation Metrics', fontsize=16)
-
-# Plot long-term metrics
-epochs = range(1, EPOCHS + 1)
-
-# Long-term MSE
-axes[0, 0].plot(epochs, long_term_history['train_mse'], 'b-', label='Train')
-axes[0, 0].plot(epochs, long_term_history['val_mse'], 'r-', label='Validation')
-axes[0, 0].set_title('Long-term MSE')
-axes[0, 0].set_xlabel('Epoch')
-axes[0, 0].set_ylabel('MSE')
-axes[0, 0].legend()
-axes[0, 0].grid(True)
-
-# Long-term MAE
-axes[0, 1].plot(epochs, long_term_history['train_mae'], 'b-', label='Train')
-axes[0, 1].plot(epochs, long_term_history['val_mae'], 'r-', label='Validation')
-axes[0, 1].set_title('Long-term MAE')
-axes[0, 1].set_xlabel('Epoch')
-axes[0, 1].set_ylabel('MAE')
-axes[0, 1].legend()
-axes[0, 1].grid(True)
-
-# Short-term MSE
-axes[1, 0].plot(epochs, short_term_history['train_mse'], 'b-', label='Train')
-axes[1, 0].plot(epochs, short_term_history['val_mse'], 'r-', label='Validation')
-axes[1, 0].set_title('Short-term MSE')
-axes[1, 0].set_xlabel('Epoch')
-axes[1, 0].set_ylabel('MSE')
-axes[1, 0].legend()
-axes[1, 0].grid(True)
-
-# Short-term MAE
-axes[1, 1].plot(epochs, short_term_history['train_mae'], 'b-', label='Train')
-axes[1, 1].plot(epochs, short_term_history['val_mae'], 'r-', label='Validation')
-axes[1, 1].set_title('Short-term MAE')
-axes[1, 1].set_xlabel('Epoch')
-axes[1, 1].set_ylabel('MAE')
-axes[1, 1].legend()
-axes[1, 1].grid(True)
-
-# Adjust layout and save
-plt.tight_layout()
-plt.show()
