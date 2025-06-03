@@ -1,0 +1,8 @@
+{
+    "patch_size": 30,
+    "stride": 10,
+    "long_term_ratio": 0.4,
+    "long_term_quantile": 0.75,
+    "train_range": 0.8,
+    "validation_range": 0.1
+}
