@@ -24,7 +24,7 @@ STATS_FILE = "data/SOLAR/solar_data_statistics.csv"
 # 每个 patch 的时间步长和变量数
 PATCH_LENGTH = 30
 NUM_VARS     = 137
-ONE_PATCH_SIZE = PATCH_LENGTH * NUM_VARS  # 4110
+ONE_PATCH_SIZE = PATCH_LENGTH * NUM_VARS  # 30*137=4110
 
 # ========= 工具函数 =========
 def prepare_batched_tensor(np_array: np.ndarray, batch_size: int) -> torch.Tensor:
@@ -46,10 +46,11 @@ def compute_metrics(pred: torch.Tensor, target: torch.Tensor) -> dict:
     return {'mse': mse.item(), 'mae': mae.item()}
 
 def load_statistics(stats_path: str) -> tuple:
-    """加载数据统计信息"""
+    """加载数据统计信息，只读取前3个变量"""
     stats_df = pd.read_csv(stats_path, index_col=0)
-    means = torch.tensor(stats_df["mean"].values, dtype=torch.float).view(1, 1, NUM_VARS)
-    stds = torch.tensor(stats_df["std"].values, dtype=torch.float).view(1, 1, NUM_VARS)
+    # 只取前3个变量的统计信息
+    means = torch.tensor(stats_df["mean"].values[:NUM_VARS], dtype=torch.float).view(1, 1, NUM_VARS)
+    stds = torch.tensor(stats_df["std"].values[:NUM_VARS], dtype=torch.float).view(1, 1, NUM_VARS)
     return means, stds
 
 def unnormalize(x_flat: torch.Tensor, means: torch.Tensor, stds: torch.Tensor) -> torch.Tensor:
@@ -109,8 +110,8 @@ print("\n[Step 2] Loading patch data...")
 
 # 训练集
 npz_train = np.load(PATCH_FILE)
-ctx_long_train  = prepare_batched_tensor(npz_train['long_term_context'],  BATCH_SIZE)  # [B, N_ctx, 30,137]
-fut_long_train  = prepare_batched_tensor(npz_train['long_term_future'],   BATCH_SIZE)  # [B, N_fut, 30,137]
+ctx_long_train  = prepare_batched_tensor(npz_train['long_term_context'],  BATCH_SIZE)  # [B, N_ctx, 30,3]
+fut_long_train  = prepare_batched_tensor(npz_train['long_term_future'],   BATCH_SIZE)  # [B, N_fut, 30,3]
 
 # 验证集
 npz_val = np.load(VAL_FILE)
@@ -148,27 +149,32 @@ with torch.no_grad():
 # z_pred_*_full 的形状均为 [B, N_fut, latent_dim]
 
 
-# ========= Step 4: 定义 ForecastHead，用于把 latent（dim=64）映射回时序 patch（dim=4110） =========
+# ========= Step 4: 定义 ForecastHead，用于把 latent（dim=64）映射回时序 patch（dim=90） =========
 class ForecastHead(nn.Module):
-    def __init__(self, latent_dim, output_dim):
+    def __init__(self, latent_dim, time_steps, num_vars):
         super().__init__()
-        self.head = nn.Sequential(
-            nn.Linear(latent_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(64, output_dim)
-        )
-    def forward(self, x):
-        return self.head(x)
+        self.time_steps = time_steps
+        self.num_vars = num_vars
+        # 每个变量一个独立的小 Head，只预测 30 步
+        self.heads = nn.ModuleList([
+            nn.Linear(latent_dim, time_steps) for _ in range(num_vars)
+        ])
+
+    def forward(self, z):
+        """
+        z: [B*N, latent_dim]
+        返回: [B*N, time_steps, num_vars]
+        """
+        # 每个 head 输出 [B*N, 30]，然后拼成 [B*N, 30, 137]
+        preds = [head(z).unsqueeze(-1) for head in self.heads]  # [(B*N, 30, 1)] * 137
+        return torch.cat(preds, dim=-1)  # [B*N, 30, 137]
 
 
 # 初始化 ForecastHead
 forecast_head = ForecastHead(
     latent_dim=LATENT_DIM,
-    output_dim=ONE_PATCH_SIZE  # 30*137=4110
+    time_steps=PATCH_LENGTH,  # 30
+    num_vars=NUM_VARS         # 137
 )
 optimizer = torch.optim.Adam(forecast_head.parameters(), lr=LEARNING_RATE)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -177,7 +183,7 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
 loss_fn = nn.MSELoss()
 
 
-# ========= Step 5: 将 "[B, N_fut, latent_dim]" 展平成 "[B*N_fut, latent_dim]"，以及对应目标 "[B*N_fut, 4110]" =========
+# ========= Step 5: 将 "[B, N_fut, latent_dim]" 展平成 "[B*N_fut, latent_dim]"，以及对应目标 "[B*N_fut, 30, 137]" =========
 def flatten_for_head(z_pred_full, fut_patches):
     """
     输入：
@@ -185,13 +191,13 @@ def flatten_for_head(z_pred_full, fut_patches):
       - fut_patches: [B, N_fut, T, F]
     返回：
       - z_flat:  [B*N_fut, latent_dim]
-      - y_flat:  [B*N_fut, T*F]
+      - y_flat:  [B*N_fut, T, F]
     """
     B, N_fut, D = z_pred_full.shape
     # flatten latent
     z_flat = z_pred_full.view(B * N_fut, D)  # [B*N_fut, latent_dim]
-    # flatten 真实值
-    y_flat = fut_patches.view(B * N_fut, PATCH_LENGTH * NUM_VARS)  # [B*N_fut, 4110]
+    # reshape 真实值到三维
+    y_flat = fut_patches.view(B * N_fut, PATCH_LENGTH, NUM_VARS)  # [B*N_fut, 30, 137]
     return z_flat, y_flat
 
 # 训练集、验证集的平坦化
@@ -230,8 +236,8 @@ for epoch in range(1, EPOCHS + 1):
     ## --- (1) 训练一步 ---
     forecast_head.train()
     optimizer.zero_grad()
-    pred_tr = forecast_head(z_head_tr)    # shape [n_tr, 4110]
-    loss_tr = loss_fn(pred_tr, y_head_tr)  # 对整个 "B*N_fut" 展平后的一批计算 MSE
+    pred_tr = forecast_head(z_head_tr)    # shape [n_tr, 30, 137]
+    loss_tr = loss_fn(pred_tr, y_head_tr)  # 直接在三维上计算 MSE
     loss_tr.backward()
     optimizer.step()
     train_losses.append(loss_tr.item())
@@ -254,10 +260,6 @@ for epoch in range(1, EPOCHS + 1):
 
     print(f"[Epoch {epoch:02d}] Train MSE={loss_tr.item():.6f} | Val MSE={loss_va.item():.6f}")
 
-    if patience_counter >= EARLY_STOPPING_PATIENCE:
-        print(f"→ Early stopping at epoch {epoch}")
-        break
-
 # 加载最优权重
 forecast_head.load_state_dict(torch.load('model/best_forecast_head.pt'))
 print("[Step 7] Best ForecastHead loaded.")
@@ -274,18 +276,21 @@ with torch.no_grad():
     
     # Flatten tensors for ForecastHead
     z_pred_test_long_flat = z_pred_test_long.view(-1, LATENT_DIM)  # [B*N, D]
-    y_test_flat = fut_long_test.view(-1, PATCH_LENGTH * NUM_VARS)  # [B*N, 4110]
+    y_test_3d = fut_long_test.view(-1, PATCH_LENGTH, NUM_VARS)  # [B*N, 30, 137]
     
     # Pass through ForecastHead
-    pred_test_flat_long = forecast_head(z_pred_test_long_flat)
+    pred_test_3d_long = forecast_head(z_pred_test_long_flat)  # [B*N, 30, 137]
     
     # Compute metrics in normalized space
-    metrics_long = compute_metrics(pred_test_flat_long, y_test_flat)
+    metrics_long = compute_metrics(pred_test_3d_long, y_test_3d)
     print("Long-term predictor → ForecastHead 预测结果 (归一化空间)：")
     print(f"  MSE = {metrics_long['mse']:.6f}, MAE = {metrics_long['mae']:.6f}")
     
     # Compute metrics in original space
-    metrics_long_restored = restore_and_evaluate(pred_test_flat_long, y_test_flat, STATS_FILE)
+    means, stds = load_statistics(STATS_FILE)
+    pred_restored = pred_test_3d_long * stds + means
+    y_restored = y_test_3d * stds + means
+    metrics_long_restored = compute_metrics(pred_restored, y_restored)
     print("Long-term predictor → ForecastHead 预测结果 (原始空间)：")
     print(f"  MSE = {metrics_long_restored['mse']:.6f}, MAE = {metrics_long_restored['mae']:.6f}")
 
@@ -298,15 +303,16 @@ with torch.no_grad():
     z_pred_test_short_flat = z_pred_test_short.view(-1, LATENT_DIM)  # [B*N, D]
     
     # Pass through ForecastHead
-    pred_test_flat_short = forecast_head(z_pred_test_short_flat)
+    pred_test_3d_short = forecast_head(z_pred_test_short_flat)  # [B*N, 30, 137]
     
     # Compute metrics in normalized space
-    metrics_short = compute_metrics(pred_test_flat_short, y_test_flat)
+    metrics_short = compute_metrics(pred_test_3d_short, y_test_3d)
     print("Short-term predictor → ForecastHead 预测结果 (归一化空间)：")
     print(f"  MSE = {metrics_short['mse']:.6f}, MAE = {metrics_short['mae']:.6f}")
     
     # Compute metrics in original space
-    metrics_short_restored = restore_and_evaluate(pred_test_flat_short, y_test_flat, STATS_FILE)
+    pred_restored = pred_test_3d_short * stds + means
+    metrics_short_restored = compute_metrics(pred_restored, y_restored)
     print("Short-term predictor → ForecastHead 预测结果 (原始空间)：")
     print(f"  MSE = {metrics_short_restored['mse']:.6f}, MAE = {metrics_short_restored['mae']:.6f}")
 

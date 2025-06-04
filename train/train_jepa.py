@@ -5,341 +5,246 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-from jepa.encoder import MyTimeSeriesEncoder, prepare_batch_from_np
+from torch.utils.data import DataLoader
+
+from patch_loader import create_patch_loader
+from jepa.encoder import MyTimeSeriesEncoder
 from jepa.predictor import JEPPredictor
-import matplotlib.pyplot as plt
 
+# ========= 全局设置 =========
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ========= settings =========
-BATCH_SIZE = 4
-LATENT_DIM = 64
-EPOCHS     = 100
-PATCH_FILE = "data/SOLAR/patches/solar_train.npz"
-VAL_FILE   = "data/SOLAR/patches/solar_val.npz"
-EARLY_STOPPING_PATIENCE = 15  # Number of epochs to wait before early stopping
-EARLY_STOPPING_DELTA = 0.00005  # Minimum change in monitored value to qualify as an improvement
+BATCH_SIZE               = 32
+LATENT_DIM               = 64
+EPOCHS                   = 75
+LEARNING_RATE            = 1e-3
+EARLY_STOPPING_PATIENCE  = 15
+EARLY_STOPPING_DELTA     = 1e-4
 
-# ========= tools =========
-def prepare_batched_tensor(np_array: np.ndarray, batch_size: int) -> torch.Tensor:
-    """
-    Convert numpy patch data into (B, N, T, F) Tensor for Encoder input
-    - For example, input shape = (172, 30, 137), batch_size = 4
-    - Output shape = (4, 43, 30, 137)
-    """
-    total, T, F = np_array.shape
-    N = total // batch_size
-    usable = batch_size * N
-    return torch.tensor(np_array[:usable], dtype=torch.float).view(batch_size, N, T, F)
+PATCH_FILE_TRAIN         = "data/SOLAR/patches/solar_train.npz"
+PATCH_FILE_VAL           = "data/SOLAR/patches/solar_val.npz"
+PATCH_FILE_TEST          = "data/SOLAR/patches/solar_test.npz"
 
+# 每个 patch 的时间步长和变量数（和你 DataLoader 里一致）
+PATCH_LENGTH             = 16
+NUM_VARS                 = 137
+
+# ========= 工具函数 =========
 def compute_metrics(pred: torch.Tensor, target: torch.Tensor) -> dict:
-    """Calculate MSE and MAE"""
+    """
+    计算 MSE 和 MAE 误差
+    pred, target 形状均为 (B, N_patches, PATCH_LENGTH, NUM_VARS)
+    """
     mse = nn.MSELoss()(pred, target)
     mae = nn.L1Loss()(pred, target)
     return {'mse': mse.item(), 'mae': mae.item()}
 
-# ========= Step 1: load patch data =========
-print("\n[Step 1] Loading patch data...")
-npz = np.load(PATCH_FILE)
-ctx_long_np = npz['long_term_context']
-fut_long_np = npz['long_term_future']
-ctx_short_np = npz['short_term_context']
-fut_short_np = npz['short_term_future']
 
-# Load validation data
-val_npz = np.load(VAL_FILE)
-val_ctx = prepare_batched_tensor(val_npz['long_term_context'], BATCH_SIZE)
-val_fut = prepare_batched_tensor(val_npz['long_term_future'], BATCH_SIZE)
+# ========= Step 1: 准备 DataLoader =========
+print("[Step 1] Preparing DataLoaders...")
 
-# Prepare batched tensors
-ctx_long_batch = prepare_batched_tensor(ctx_long_np, BATCH_SIZE)
-fut_long_batch = prepare_batched_tensor(fut_long_np, BATCH_SIZE)
-ctx_short_batch = prepare_batched_tensor(ctx_short_np, BATCH_SIZE)
-fut_short_batch = prepare_batched_tensor(fut_short_np, BATCH_SIZE)
+# 训练集：shuffle=True，每轮 epoch 都打乱样本顺序
+train_loader = create_patch_loader(PATCH_FILE_TRAIN, BATCH_SIZE, shuffle=True)
+# 验证集 / 测试集：shuffle=False（保持固定顺序）
+val_loader   = create_patch_loader(PATCH_FILE_VAL,   BATCH_SIZE, shuffle=False)
+test_loader  = create_patch_loader(PATCH_FILE_TEST,  BATCH_SIZE, shuffle=False)
 
-print(f"\n[Debug] Long-term shapes:")
-print(f"- Context: {ctx_long_batch.shape}")
-print(f"- Target: {fut_long_batch.shape}")
-print(f"- Short-term shapes:")
-print(f"- Context: {ctx_short_batch.shape}")
-print(f"- Target: {fut_short_batch.shape}")
+print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)} | Test batches: {len(test_loader)}")
 
-# ========= Step 2: initialize model =========
+
+# ========= Step 2: 初始化模型 =========
+print("\n[Step 2] Initializing models...")
+
+# Encoder：把每个 (B, N_ctx, T, F) → (B, N_ctx, D)
 encoder = MyTimeSeriesEncoder(
-    patch_length=30,
-    num_vars=137,
+    patch_length=PATCH_LENGTH,
+    num_vars=NUM_VARS,
     latent_dim=LATENT_DIM,
     num_layers=2,
     num_attention_heads=2,
-)
+).to(DEVICE)
 
-# Initialize two predictors
-predictor_long = JEPPredictor(
+# Predictor：把 (B, N_ctx, D) + (B, N_tgt, D) → 输出 (B, N_tgt, D) + loss
+predictor = JEPPredictor(
     latent_dim=LATENT_DIM,
-    context_length=ctx_long_batch.shape[1],
-    prediction_length=fut_long_batch.shape[1],
+    context_length=None,    # 会在 forward 时根据输入自动推断
+    prediction_length=None, # 同上
     num_layers=4,
     num_heads=4
+).to(DEVICE)
+
+# 优化器：同时优化 Encoder 和 Predictor
+optimizer = torch.optim.Adam(
+    list(encoder.parameters()) + list(predictor.parameters()),
+    lr=LEARNING_RATE
 )
 
-predictor_short = JEPPredictor(
-    latent_dim=LATENT_DIM,
-    context_length=ctx_short_batch.shape[1],
-    prediction_length=fut_short_batch.shape[1],
-    num_layers=4,
-    num_heads=4
-)
+print(f"Encoder parameters: {sum(p.numel() for p in encoder.parameters())}")
+print(f"Predictor parameters: {sum(p.numel() for p in predictor.parameters())}")
 
-print(f"\n[Debug] Model configurations:")
-print(f"- Encoder latent dim: {LATENT_DIM}")
-print(f"- Long-term context/prediction: {ctx_long_batch.shape[1]}/{fut_long_batch.shape[1]}")
-print(f"- Short-term context/prediction: {ctx_short_batch.shape[1]}/{fut_short_batch.shape[1]}")
 
-# Initialize two optimizers
-optimizer_long = torch.optim.Adam(
-    list(encoder.parameters()) + list(predictor_long.parameters()),
-    lr=1e-3
-)
-
-optimizer_short = torch.optim.Adam(
-    list(encoder.parameters()) + list(predictor_short.parameters()),
-    lr=1e-3
-)
-
-# ========= Step 3: train long-term prediction =========
-print("\n[Step 3] Training long-term prediction...")
-
-# Initialize metrics history
-long_term_history = {
-    'train_mse': [], 'train_mae': [],
-    'val_mse': [], 'val_mae': []
-}
+# ========= Step 3: 训练 + 验证 =========
+print("\n[Step 3] Training and validating...")
 
 best_val_mse = float('inf')
 patience_counter = 0
-best_model_state = None
+best_state = None
 
-for epoch in range(1, EPOCHS + 1):
-    # Training
-    encoder.train()
-    predictor_long.train()
-    optimizer_long.zero_grad()
-
-    ctx_L = encoder(ctx_long_batch)
-    tgt_L = encoder(fut_long_batch)
-    pred_L, loss_L = predictor_long(ctx_L, tgt_L)
-    
-    loss_L.backward()
-    optimizer_long.step()
-    
-    # Calculate training metrics
-    metrics_L = compute_metrics(pred_L, tgt_L)
-    
-    # Record metrics
-    long_term_history['train_mse'].append(metrics_L['mse'])
-    long_term_history['train_mae'].append(metrics_L['mae'])
-    
-    # Validation
-    encoder.eval()
-    predictor_long.eval()
-    with torch.no_grad():
-        val_ctx_L = encoder(val_ctx)
-        val_tgt_L = encoder(val_fut)
-        val_pred_L, _ = predictor_long(val_ctx_L, val_tgt_L)
-        val_metrics_L = compute_metrics(val_pred_L, val_tgt_L)
-        
-        # Record validation metrics
-        long_term_history['val_mse'].append(val_metrics_L['mse'])
-        long_term_history['val_mae'].append(val_metrics_L['mae'])
-
-        # Early stopping check
-        if val_metrics_L['mse'] < best_val_mse - EARLY_STOPPING_DELTA:
-            best_val_mse = val_metrics_L['mse']
-            patience_counter = 0
-            # Save best model state
-            best_model_state = {
-                'encoder_state_dict': encoder.state_dict(),
-                'predictor_long_state_dict': predictor_long.state_dict(),
-                'epoch': epoch,
-                'val_mse': best_val_mse
-            }
-        else:
-            patience_counter += 1
-
-    # Print training progress
-    print(f"[Long-term Epoch {epoch:02d}] Loss: {loss_L.item():.6f}, MSE: {metrics_L['mse']:.6f}, MAE: {metrics_L['mae']:.6f}")
-    print(f"                     Val   - MSE: {val_metrics_L['mse']:.6f}, MAE: {val_metrics_L['mae']:.6f}")
-
-    # Early stopping
-    if patience_counter >= EARLY_STOPPING_PATIENCE:
-        print(f"\nEarly stopping triggered after {epoch} epochs")
-        break
-
-    # Print shape information in the first epoch
-    if epoch == 1:
-        print(f"\n[Debug] Long-term shapes:")
-        print(f"- Context: {ctx_L.shape}")
-        print(f"- Target: {tgt_L.shape}")
-        print(f"- Prediction: {pred_L.shape}")
-
-print("\n[Long-term training completed]")
-
-# ========= Step 4: train short-term prediction =========
-print("\n[Step 4] Training short-term prediction...")
-
-# Initialize metrics history
-short_term_history = {
+# 用来记录每轮的指标
+history = {
     'train_mse': [], 'train_mae': [],
-    'val_mse': [], 'val_mae': []
+    'val_mse':   [], 'val_mae':   []
 }
 
-best_val_mse = float('inf')
-patience_counter = 0
-best_short_model_state = None
-
 for epoch in range(1, EPOCHS + 1):
-    # Training
+    # ------ 训练阶段 ------
     encoder.train()
-    predictor_short.train()
-    optimizer_short.zero_grad()
+    predictor.train()
+    running_train_mse = 0.0
+    running_train_mae = 0.0
+    train_samples = 0
 
-    ctx_S = encoder(ctx_short_batch)
-    tgt_S = encoder(fut_short_batch)
-    pred_S, loss_S = predictor_short(ctx_S, tgt_S)
-    
-    loss_S.backward()
-    optimizer_short.step()
-    
-    # Calculate training metrics
-    metrics_S = compute_metrics(pred_S, tgt_S)
-    
-    # Record metrics
-    short_term_history['train_mse'].append(metrics_S['mse'])
-    short_term_history['train_mae'].append(metrics_S['mae'])
+    for x_batch, y_batch in train_loader:
+        # x_batch, y_batch: (B, N_patches, PATCH_LENGTH, NUM_VARS)
+        x_batch = x_batch.to(DEVICE)
+        y_batch = y_batch.to(DEVICE)
 
-    # Validation
+        optimizer.zero_grad()
+
+        # 1) 用 Encoder 编码上下文 patch（历史）
+        ctx_latent = encoder(x_batch)  # (B, N_ctx, D)
+        # 2) 用 Encoder 编码目标 patch（未来），作为监督信息
+        tgt_latent = encoder(y_batch)  # (B, N_tgt, D)
+
+        # 3) Predictor 用上下文 latent + 目标 latent 做 teacher-forcing 训练
+        pred_latent, loss = predictor(ctx_latent, tgt_latent)
+
+        # 4) 反向传播
+        loss.backward()
+        optimizer.step()
+
+        # 5) 计算并累计训练指标
+        with torch.no_grad():
+            # Predictor 输出是 latent 格式，需要把 latent decode 或直接比 latent
+            # 这里我们直接比 latent，即 latent-space MSE/MAE
+            # pred_latent / tgt_latent 均为 (B, N_tgt, D)
+            # 但本例中 compute_metrics 期望 (B, N, T, F)，所以我们重用 MSELoss：
+            mse_val = nn.MSELoss(reduction='sum')(pred_latent, tgt_latent).item()
+            mae_val = nn.L1Loss(reduction='sum')(pred_latent, tgt_latent).item()
+            running_train_mse += mse_val
+            running_train_mae += mae_val
+            train_samples += pred_latent.numel()  # B * N_tgt * D
+
+    # 训练集平均误差
+    avg_train_mse = running_train_mse / train_samples
+    avg_train_mae = running_train_mae / train_samples
+    history['train_mse'].append(avg_train_mse)
+    history['train_mae'].append(avg_train_mae)
+
+    # ------ 验证阶段 ------
     encoder.eval()
-    predictor_short.eval()
+    predictor.eval()
+    running_val_mse = 0.0
+    running_val_mae = 0.0
+    val_samples = 0
+
     with torch.no_grad():
-        val_ctx_S = encoder(val_ctx)
-        val_tgt_S = encoder(val_fut)
-        val_pred_S, _ = predictor_short(val_ctx_S, val_tgt_S)
-        val_metrics_S = compute_metrics(val_pred_S, val_tgt_S)
-        
-        # Record validation metrics
-        short_term_history['val_mse'].append(val_metrics_S['mse'])
-        short_term_history['val_mae'].append(val_metrics_S['mae'])
+        for x_batch, y_batch in val_loader:
+            x_batch = x_batch.to(DEVICE)
+            y_batch = y_batch.to(DEVICE)
 
-        # Early stopping check
-        if val_metrics_S['mse'] < best_val_mse - EARLY_STOPPING_DELTA:
-            best_val_mse = val_metrics_S['mse']
-            patience_counter = 0
-            # Save best model state
-            best_short_model_state = {
-                'encoder_state_dict': encoder.state_dict(),
-                'predictor_short_state_dict': predictor_short.state_dict(),
-                'epoch': epoch,
-                'val_mse': best_val_mse
-            }
-        else:
-            patience_counter += 1
+            ctx_latent = encoder(x_batch)
+            tgt_latent = encoder(y_batch)
+            val_pred_latent, _ = predictor(ctx_latent, tgt_latent)
 
-    # Print training progress
-    print(f"[Short-term Epoch {epoch:02d}] Loss: {loss_S.item():.6f}, MSE: {metrics_S['mse']:.6f}, MAE: {metrics_S['mae']:.6f}")
-    print(f"                     Val   - MSE: {val_metrics_S['mse']:.6f}, MAE: {val_metrics_S['mae']:.6f}")
+            mse_val = nn.MSELoss(reduction='sum')(val_pred_latent, tgt_latent).item()
+            mae_val = nn.L1Loss(reduction='sum')(val_pred_latent, tgt_latent).item()
+            running_val_mse += mse_val
+            running_val_mae += mae_val
+            val_samples += val_pred_latent.numel()
+
+    avg_val_mse = running_val_mse / val_samples
+    avg_val_mae = running_val_mae / val_samples
+    history['val_mse'].append(avg_val_mse)
+    history['val_mae'].append(avg_val_mae)
+
+    # ------ Early Stopping 判断 ------
+    if avg_val_mse < best_val_mse - EARLY_STOPPING_DELTA:
+        best_val_mse = avg_val_mse
+        patience_counter = 0
+        # 保存最佳模型状态
+        best_state = {
+            'encoder':       encoder.state_dict(),
+            'predictor':     predictor.state_dict(),
+            'epoch':         epoch,
+            'val_mse':       avg_val_mse
+        }
+    else:
+        patience_counter += 1
+
+    # ------ 打印当前 epoch 信息 ------
+    print(f"[Epoch {epoch:02d}] "
+          f"Train MSE: {avg_train_mse:.6f}, MAE: {avg_train_mae:.6f} | "
+          f" Val MSE: {avg_val_mse:.6f}, MAE: {avg_val_mae:.6f}")
+
+    # First-epoch shape调试信息
+    if epoch == 1:
+        print(f"  [Debug Shapes] "
+              f"x_batch: {x_batch.shape}, y_batch: {y_batch.shape}")
+        print(f"                ctx_latent: {ctx_latent.shape}, tgt_latent: {tgt_latent.shape}")
+        print(f"                pred_latent: {val_pred_latent.shape}")
 
     # Early stopping
     if patience_counter >= EARLY_STOPPING_PATIENCE:
-        print(f"\nEarly stopping triggered after {epoch} epochs")
+        print(f"\nEarly stopping triggered at epoch {epoch}")
         break
 
-    # Print shape information in the first epoch
-    if epoch == 1:
-        print(f"\n[Debug] Short-term shapes:")
-        print(f"- Context: {ctx_S.shape}")
-        print(f"- Target: {tgt_S.shape}")
-        print(f"- Prediction: {pred_S.shape}")
+print("\n[Training completed]")
 
-print("\n[Short-term training completed]")
-print("\n[All training completed]")
 
-# ========= Step 5: Save best models =========
-print("\n[Step 5] Saving best models...")
+# ========= Step 4: 保存最佳模型 =========
+if best_state is not None:
+    os.makedirs("model", exist_ok=True)
+    torch.save({
+        'encoder_state_dict':   best_state['encoder'],
+        'predictor_state_dict': best_state['predictor'],
+        'latent_dim':           LATENT_DIM,
+        'patch_length':         PATCH_LENGTH,
+        'num_vars':             NUM_VARS
+    }, "model/jepa_best.pt")
+    print(f"Best model saved (epoch {best_state['epoch']}), val_mse = {best_state['val_mse']:.6f}")
 
-# Create a directory for saving models if it doesn't exist
-os.makedirs('model', exist_ok=True)
 
-# Save the best models
-torch.save({
-    'encoder_state_dict': best_model_state['encoder_state_dict'],
-    'predictor_long_state_dict': best_model_state['predictor_long_state_dict'],
-    'predictor_short_state_dict': best_short_model_state['predictor_short_state_dict'],
-    'encoder_config': {
-        'patch_length': 30,
-        'num_vars': 137,
-        'latent_dim': LATENT_DIM,
-        'num_layers': 2,
-        'num_attention_heads': 2,
-    },
-    'predictor_long_config': {
-        'latent_dim': LATENT_DIM,
-        'context_length': ctx_long_batch.shape[1],
-        'prediction_length': fut_long_batch.shape[1],
-        'num_layers': 4,
-        'num_heads': 4
-    },
-    'predictor_short_config': {
-        'latent_dim': LATENT_DIM,
-        'context_length': ctx_short_batch.shape[1],
-        'prediction_length': fut_short_batch.shape[1],
-        'num_layers': 4,
-        'num_heads': 4
-    },
-    'training_info': {
-        'long_term_best_epoch': best_model_state['epoch'],
-        'long_term_best_val_mse': best_model_state['val_mse'],
-        'short_term_best_epoch': best_short_model_state['epoch'],
-        'short_term_best_val_mse': best_short_model_state['val_mse']
-    }
-}, 'model/jepa_models.pt')
+# ========= Step 5: 测试评估（可选） =========
+print("\n[Step 5] Testing on unseen data...")
+encoder.load_state_dict(best_state['encoder'])
+predictor.load_state_dict(best_state['predictor'])
+encoder.eval()
+predictor.eval()
 
-print("Best models saved to 'model/jepa_models.pt'")
+running_test_mse = 0.0
+running_test_mae = 0.0
+test_samples = 0
 
-# ========= Step 6: Plot metrics: two subplots in one figure =========
-print("\n[Step 6] Plotting metrics with two subplots...")
+with torch.no_grad():
+    for x_batch, y_batch in test_loader:
+        x_batch = x_batch.to(DEVICE)
+        y_batch = y_batch.to(DEVICE)
 
-fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        ctx_latent = encoder(x_batch)
+        tgt_latent = encoder(y_batch)
+        test_pred_latent, _ = predictor(ctx_latent, tgt_latent)
 
-# Use actual number of epochs for plotting
-long_term_epochs = range(1, len(long_term_history['train_mse']) + 1)
-short_term_epochs = range(1, len(short_term_history['train_mse']) + 1)
+        mse_val = nn.MSELoss(reduction='sum')(test_pred_latent, tgt_latent).item()
+        mae_val = nn.L1Loss(reduction='sum')(test_pred_latent, tgt_latent).item()
+        running_test_mse += mse_val
+        running_test_mae += mae_val
+        test_samples += test_pred_latent.numel()
 
-# Short-term subplot (left)
-axes[0].plot(short_term_epochs, short_term_history['train_mse'], label='Train MSE', color='orange', linestyle='-')
-axes[0].plot(short_term_epochs, short_term_history['val_mse'], label='Val MSE', color='orange', linestyle='--')
-axes[0].plot(short_term_epochs, short_term_history['train_mae'], label='Train MAE', color='red', linestyle='-')
-axes[0].plot(short_term_epochs, short_term_history['val_mae'], label='Val MAE', color='red', linestyle='--')
-axes[0].set_title('Short-term Metrics')
-axes[0].set_xlabel('Epoch')
-axes[0].set_ylabel('Value')
-axes[0].legend()
-axes[0].grid(True)
+avg_test_mse = running_test_mse / test_samples
+avg_test_mae = running_test_mae / test_samples
 
-# Long-term subplot (right)
-axes[1].plot(long_term_epochs, long_term_history['train_mse'], label='Train MSE', color='b', linestyle='-')
-axes[1].plot(long_term_epochs, long_term_history['val_mse'], label='Val MSE', color='b', linestyle='--')
-axes[1].plot(long_term_epochs, long_term_history['train_mae'], label='Train MAE', color='c', linestyle='-')
-axes[1].plot(long_term_epochs, long_term_history['val_mae'], label='Val MAE', color='c', linestyle='--')
-axes[1].set_title('Long-term Metrics')
-axes[1].set_xlabel('Epoch')
-axes[1].set_ylabel('Value')
-axes[1].legend()
-axes[1].grid(True)
-
-fig.suptitle('Short-term and Long-term Metrics Overview', fontsize=16)
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-plt.savefig('metrics_overview.png', dpi=300, bbox_inches='tight')
-plt.show()
+print(f"Test MSE: {avg_test_mse:.6f}, MAE: {avg_test_mae:.6f}")

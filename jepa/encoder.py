@@ -74,7 +74,7 @@ class MyTimeSeriesEncoder(nn.Module):
     def __init__(
         self,
         patch_length: int = 30,
-        num_vars: int = 137,
+        num_vars: int = 3,
         latent_dim: int = 64,
         num_layers: int = 2,
         num_attention_heads: int = 2,
@@ -116,6 +116,7 @@ class MyTimeSeriesEncoder(nn.Module):
             Tensor, shape = (B, N_ctx, latent_dim)
         """
         B, N, T, F = x.shape
+        assert F == self.num_vars, f"Input feature dimension {F} does not match num_vars {self.num_vars}"
 
         # 1) 拉平成 (B, N, T*F)
         x = x.view(B, N, T * F)
