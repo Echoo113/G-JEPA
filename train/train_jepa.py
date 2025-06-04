@@ -21,8 +21,9 @@ BATCH_SIZE               = 32
 LATENT_DIM               = 64
 EPOCHS                   = 75
 LEARNING_RATE            = 1e-3
-EARLY_STOPPING_PATIENCE  = 15
-EARLY_STOPPING_DELTA     = 1e-4
+#make it stopping in more conservative way
+EARLY_STOPPING_PATIENCE  = 20
+EARLY_STOPPING_DELTA     = 1e-5
 
 PATCH_FILE_TRAIN         = "data/SOLAR/patches/solar_train.npz"
 PATCH_FILE_VAL           = "data/SOLAR/patches/solar_val.npz"
@@ -128,15 +129,11 @@ for epoch in range(1, EPOCHS + 1):
 
         # 5) 计算并累计训练指标
         with torch.no_grad():
-            # Predictor 输出是 latent 格式，需要把 latent decode 或直接比 latent
-            # 这里我们直接比 latent，即 latent-space MSE/MAE
-            # pred_latent / tgt_latent 均为 (B, N_tgt, D)
-            # 但本例中 compute_metrics 期望 (B, N, T, F)，所以我们重用 MSELoss：
             mse_val = nn.MSELoss(reduction='sum')(pred_latent, tgt_latent).item()
             mae_val = nn.L1Loss(reduction='sum')(pred_latent, tgt_latent).item()
             running_train_mse += mse_val
             running_train_mae += mae_val
-            train_samples += pred_latent.numel()  # B * N_tgt * D
+            train_samples += pred_latent.numel()
 
     # 训练集平均误差
     avg_train_mse = running_train_mse / train_samples
@@ -175,15 +172,17 @@ for epoch in range(1, EPOCHS + 1):
     if avg_val_mse < best_val_mse - EARLY_STOPPING_DELTA:
         best_val_mse = avg_val_mse
         patience_counter = 0
-        # 保存最佳模型状态
         best_state = {
-            'encoder':       encoder.state_dict(),
-            'predictor':     predictor.state_dict(),
-            'epoch':         epoch,
-            'val_mse':       avg_val_mse
+            'encoder': encoder.state_dict(),
+            'predictor': predictor.state_dict(),
+            'epoch': epoch,
+            'val_mse': avg_val_mse
         }
     else:
         patience_counter += 1
+        if patience_counter >= EARLY_STOPPING_PATIENCE:
+            print(f"\nEarly stopping triggered at epoch {epoch}")
+            break
 
     # ------ 打印当前 epoch 信息 ------
     print(f"[Epoch {epoch:02d}] "
@@ -196,11 +195,6 @@ for epoch in range(1, EPOCHS + 1):
               f"x_batch: {x_batch.shape}, y_batch: {y_batch.shape}")
         print(f"                ctx_latent: {ctx_latent.shape}, tgt_latent: {tgt_latent.shape}")
         print(f"                pred_latent: {val_pred_latent.shape}")
-
-    # Early stopping
-    if patience_counter >= EARLY_STOPPING_PATIENCE:
-        print(f"\nEarly stopping triggered at epoch {epoch}")
-        break
 
 print("\n[Training completed]")
 
