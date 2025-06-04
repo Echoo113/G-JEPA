@@ -18,12 +18,12 @@ from jepa.predictor import JEPPredictor
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 BATCH_SIZE               = 32
-LATENT_DIM               = 64
-EPOCHS                   = 75
-LEARNING_RATE            = 1e-3
-#make it stopping in more conservative way
-EARLY_STOPPING_PATIENCE  = 20
-EARLY_STOPPING_DELTA     = 1e-5
+LATENT_DIM               = 256
+EPOCHS                   = 100
+LEARNING_RATE            = 5e-4
+WEIGHT_DECAY            = 1e-6
+EARLY_STOPPING_PATIENCE  = 30
+EARLY_STOPPING_DELTA     = 1e-6
 
 PATCH_FILE_TRAIN         = "data/SOLAR/patches/solar_train.npz"
 PATCH_FILE_VAL           = "data/SOLAR/patches/solar_val.npz"
@@ -64,8 +64,10 @@ encoder = MyTimeSeriesEncoder(
     patch_length=PATCH_LENGTH,
     num_vars=NUM_VARS,
     latent_dim=LATENT_DIM,
-    num_layers=2,
-    num_attention_heads=2,
+    num_layers=6,                # 增加到6层
+    num_attention_heads=8,       # 增加到8个头
+    ffn_dim=LATENT_DIM*4,       # 设置FFN维度为latent_dim的4倍
+    dropout=0.1                  # 添加dropout
 ).to(DEVICE)
 
 # Predictor：把 (B, N_ctx, D) + (B, N_tgt, D) → 输出 (B, N_tgt, D) + loss
@@ -77,10 +79,20 @@ predictor = JEPPredictor(
     num_heads=4
 ).to(DEVICE)
 
-# 优化器：同时优化 Encoder 和 Predictor
-optimizer = torch.optim.Adam(
+# 优化器：使用AdamW并添加weight decay
+optimizer = torch.optim.AdamW(
     list(encoder.parameters()) + list(predictor.parameters()),
-    lr=LEARNING_RATE
+    lr=LEARNING_RATE,
+    weight_decay=WEIGHT_DECAY
+)
+
+# 添加学习率调度器
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode='min',
+    factor=0.5,
+    patience=5,
+    verbose=True
 )
 
 print(f"Encoder parameters: {sum(p.numel() for p in encoder.parameters())}")
@@ -183,6 +195,9 @@ for epoch in range(1, EPOCHS + 1):
         if patience_counter >= EARLY_STOPPING_PATIENCE:
             print(f"\nEarly stopping triggered at epoch {epoch}")
             break
+
+    # 更新学习率
+    scheduler.step(avg_val_mse)
 
     # ------ 打印当前 epoch 信息 ------
     print(f"[Epoch {epoch:02d}] "

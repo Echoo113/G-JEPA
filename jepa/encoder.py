@@ -1,40 +1,6 @@
+import math
 import torch
 import torch.nn as nn
-import math
-import numpy as np
-
-def split_into_batches(patches: torch.Tensor, batch_size: int) -> torch.Tensor:
-    """
-    Args:
-        patches: Tensor, shape = (total_patch, T, F)
-        batch_size: 需要的 batch size
-    
-    Returns:
-        Tensor, shape = (B, N, T, F)，如果不足整除则截断多余 patch
-    """
-    total_patches, T, F = patches.shape
-    assert total_patches >= batch_size, "总 patch 数不能小于 batch size"
-
-    # 每个样本应该有的 patch 数 N
-    N = total_patches // batch_size
-
-    usable_patch_count = batch_size * N
-    batched = patches[:usable_patch_count].view(batch_size, N, T, F)
-    return batched
-
-def prepare_batch_from_np(np_array: np.ndarray, batch_size: int) -> torch.Tensor:
-    """
-    从 numpy array → Tensor，并按 batch_size 拼接
-    
-    Args:
-        np_array: numpy array, shape = (total_patch, T, F)
-        batch_size: 需要的 batch size
-    
-    Returns:
-        Tensor, shape = (B, N, T, F)
-    """
-    tensor = torch.tensor(np_array, dtype=torch.float)
-    return split_into_batches(tensor, batch_size)
 
 class PositionalEncoding(nn.Module):
     """
@@ -45,12 +11,6 @@ class PositionalEncoding(nn.Module):
         self.d_model = d_model
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Tensor, shape = (B, N, D)
-        Returns:
-            Tensor, same shape, 加上位置编码
-        """
         B, N, D = x.shape
         device = x.device
 
@@ -62,22 +22,17 @@ class PositionalEncoding(nn.Module):
         pe = torch.zeros(N, D, device=device)
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-
         pe = pe.unsqueeze(0)  # → (1, N, D)
-        return x + pe  # 自动 broadcast 到 (B, N, D)
+        return x + pe
 
 class MyTimeSeriesEncoder(nn.Module):
-    """
-    仿 Huggingface TimeSeriesTransformer 的简化版 Encoder
-    支持多变量、多 patch 输入
-    """
     def __init__(
         self,
-        patch_length: int = 30,
-        num_vars: int = 3,
-        latent_dim: int = 64,
-        num_layers: int = 2,
-        num_attention_heads: int = 2,
+        patch_length: int = 16,
+        num_vars: int = 137,
+        latent_dim: int = 256,
+        num_layers: int = 4,
+        num_attention_heads: int = 8,
         ffn_dim: int = None,
         dropout: float = 0.1,
     ):
@@ -85,53 +40,65 @@ class MyTimeSeriesEncoder(nn.Module):
         self.patch_length = patch_length
         self.num_vars = num_vars
         self.latent_dim = latent_dim
-
         if ffn_dim is None:
             ffn_dim = latent_dim * 4
 
-        # 1) Patch embedding: 将 (T * F) 映射到 latent_dim
-        self.patch_embedding = nn.Linear(patch_length * num_vars, latent_dim)
+        # —— 在这里先做一个小型 1D Conv，把 (T, F) → (T, hidden_dim)
+        self.hidden_dim = latent_dim // 2  # 举例：hidden_dim = 128
+        self.conv1 = nn.Conv1d(
+            in_channels=num_vars,
+            out_channels=self.hidden_dim,
+            kernel_size=3,
+            padding=1,
+        )
+        self.act = nn.GELU()
 
-        # 2) 动态位置编码层（不使用 max_len）
-        self.pos_encoding = PositionalEncoding(latent_dim)
+        # 先对每个时间步 t 加位置编码 (T, hidden_dim)
+        self.time_pos_emb = nn.Parameter(torch.randn(patch_length, self.hidden_dim))
 
-        # 3) Transformer 编码层
+        # 然后把 (T, hidden_dim) flatten → (T * hidden_dim) 再映射到 latent_dim
+        self.fc_embed = nn.Linear(patch_length * self.hidden_dim, latent_dim)
+
+        # —— 动态位置编码：对 patch 维度 (N) 做位置编码
+        self.patch_pos_encoding = PositionalEncoding(latent_dim)
+
+        # —— Transformer 编码层
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=latent_dim,
             nhead=num_attention_heads,
             dim_feedforward=ffn_dim,
             dropout=dropout,
-            batch_first=True,  # 注意：我们中间会 transpose
+            batch_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # 4) 最后 LayerNorm
+        # —— 最后 LayerNorm
         self.norm = nn.LayerNorm(latent_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Args:
-            x: Tensor, shape = (B, N_ctx, T, F)
-        Returns:
-            Tensor, shape = (B, N_ctx, latent_dim)
+        x: (B, N, T, F)
         """
         B, N, T, F = x.shape
-        assert F == self.num_vars, f"Input feature dimension {F} does not match num_vars {self.num_vars}"
+        assert F == self.num_vars
+        # 1) 先把 x -> (B*N, F, T)，做 1D Conv
+        x_ = x.view(B * N, T, F).transpose(1, 2)   # (B*N, F, T)
+        h = self.act(self.conv1(x_))              # (B*N, hidden_dim, T)
+        # 2) 加时间位置编码 (T, hidden_dim)
+        h = h.transpose(1, 2) + self.time_pos_emb.unsqueeze(0)  # (B*N, T, hidden_dim)
+        # 3) Flatten 时间维度，再映射到 latent
+        h = h.reshape(B * N, T * self.hidden_dim)      # (B*N, T*hidden_dim)
+        patch_latent = self.fc_embed(h)           # (B*N, latent_dim)
+        patch_latent = patch_latent.view(B, N, self.latent_dim)  # (B, N, latent_dim)
 
-        # 1) 拉平成 (B, N, T*F)
-        x = x.view(B, N, T * F)
+        # 4) 对 patch 维度做位置编码 (B, N, latent_dim)
+        patch_latent = self.patch_pos_encoding(patch_latent)
 
-        # 2) 线性映射
-        x = self.patch_embedding(x)  # → (B, N, D)
+        # 5) Transformer 编码：先转到 (N, B, D)
+        y = patch_latent.transpose(0, 1)           # (N, B, D)
+        y = self.transformer(y)                   # (N, B, D)
+        y = y.transpose(0, 1)                      # (B, N, D)
 
-        # 3) 加上位置编码（动态生成）
-        x = self.pos_encoding(x)     # → (B, N, D)
-
-        # 4) Transformer 编码：转置成 (N, B, D)
-        x = x.transpose(0, 1)
-        x = self.transformer(x)
-        x = x.transpose(0, 1)        # → (B, N, D)
-
-        # 5) LayerNorm
-        x = self.norm(x)
-        return x
+        # 6) LayerNorm
+        y = self.norm(y)                           # (B, N, D)
+        return y

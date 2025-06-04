@@ -1,334 +1,279 @@
 import sys
 import os
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-import matplotlib.pyplot as plt
-import pandas as pd
+from torch.utils.data import DataLoader
+
+from patch_loader import create_patch_loader
 from jepa.encoder import MyTimeSeriesEncoder
 from jepa.predictor import JEPPredictor
 
-# ========= 设置 =========
-BATCH_SIZE = 4
-LATENT_DIM = 64
-EPOCHS     = 50
-LEARNING_RATE = 1e-3
-EARLY_STOPPING_PATIENCE = 10
-EARLY_STOPPING_DELTA    = 1e-4
+# ========= 全局设置 =========
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-PATCH_FILE = "data/SOLAR/patches/solar_train.npz"
-VAL_FILE   = "data/SOLAR/patches/solar_val.npz"
-TEST_FILE  = "data/SOLAR/patches/solar_test.npz"
-STATS_FILE = "data/SOLAR/solar_data_statistics.csv"
+BATCH_SIZE      = 32
+LATENT_DIM      = 256
+EPOCHS_FOCUS    = 40         # 增加训练轮数到40
+LEARNING_RATE_FH = 5e-4      # 降低学习率
+WEIGHT_DECAY    = 1e-6       # 添加权重衰减
 
-# 每个 patch 的时间步长和变量数
-PATCH_LENGTH = 30
+# 下游任务用的同样数据加载器
+PATCH_FILE_TRAIN = "data/SOLAR/patches/solar_train.npz"
+PATCH_FILE_VAL   = "data/SOLAR/patches/solar_val.npz"
+PATCH_FILE_TEST  = "data/SOLAR/patches/solar_test.npz"
+
+# Patch 的长度和变量数，与主模型保持一致
+PATCH_LENGTH = 16
 NUM_VARS     = 137
-ONE_PATCH_SIZE = PATCH_LENGTH * NUM_VARS  # 30*137=4110
 
-# ========= 工具函数 =========
-def prepare_batched_tensor(np_array: np.ndarray, batch_size: int) -> torch.Tensor:
-    """
-    将形状 (total_patches, T, F) 的 numpy 数组重组为 (B, N, T, F) 形式，
-    其中 B=batch_size, N=total_patches//B.
-    """
-    total, T, F = np_array.shape
-    N = total // batch_size
-    usable = batch_size * N
-    return torch.tensor(
-        np_array[:usable], dtype=torch.float
-    ).view(batch_size, N, T, F)
-
-def compute_metrics(pred: torch.Tensor, target: torch.Tensor) -> dict:
-    """计算整体 MSE 和 MAE"""
-    mse = nn.MSELoss()(pred, target)
-    mae = nn.L1Loss()(pred, target)
-    return {'mse': mse.item(), 'mae': mae.item()}
-
-def load_statistics(stats_path: str) -> tuple:
-    """加载数据统计信息，只读取前3个变量"""
-    stats_df = pd.read_csv(stats_path, index_col=0)
-    # 只取前3个变量的统计信息
-    means = torch.tensor(stats_df["mean"].values[:NUM_VARS], dtype=torch.float).view(1, 1, NUM_VARS)
-    stds = torch.tensor(stats_df["std"].values[:NUM_VARS], dtype=torch.float).view(1, 1, NUM_VARS)
-    return means, stds
-
-def unnormalize(x_flat: torch.Tensor, means: torch.Tensor, stds: torch.Tensor) -> torch.Tensor:
-    """
-    还原预测值到原始尺度
-    Args:
-        x_flat: shape (B, 30*137) 的展平张量
-        means: shape (1, 1, 137) 的均值
-        stds: shape (1, 1, 137) 的标准差
-    Returns:
-        shape (B, 30*137) 的还原后的展平张量
-    """
-    B = x_flat.shape[0]
-    x_reshaped = x_flat.view(B, PATCH_LENGTH, NUM_VARS)  # (B, T, F)
-    x_restored = x_reshaped * stds + means
-    return x_restored.view(B, -1)  # (B, 30*137)
-
-def restore_and_evaluate(pred_flat: torch.Tensor, y_flat: torch.Tensor, stats_path: str) -> dict:
-    """
-    还原预测值和真实值到原始尺度，并计算指标
-    Args:
-        pred_flat: shape (B, 30*137) 的预测值
-        y_flat: shape (B, 30*137) 的真实值
-        stats_path: 统计信息文件路径
-    Returns:
-        包含原始尺度下 MSE 和 MAE 的字典
-    """
-    means, stds = load_statistics(stats_path)
-    y_true_restored = unnormalize(y_flat, means, stds)
-    y_pred_restored = unnormalize(pred_flat, means, stds)
-    return compute_metrics(y_pred_restored, y_true_restored)
-
-# ========= Step 1: 加载并冻结 encoder + predictor_short/predictor_long =========
-print("\n[Step 1] Loading pretrained JEPA models...")
-
-ckpt = torch.load('model/jepa_models.pt', map_location='cpu')
-encoder = MyTimeSeriesEncoder(**ckpt['encoder_config'])
-predictor_short = JEPPredictor(**ckpt['predictor_short_config'])
-predictor_long  = JEPPredictor(**ckpt['predictor_long_config'])
-
-encoder.load_state_dict(ckpt['encoder_state_dict'])
-predictor_short.load_state_dict(ckpt['predictor_short_state_dict'])
-predictor_long.load_state_dict( ckpt['predictor_long_state_dict'])
-
-# 冻结参数
-encoder.eval()
-predictor_short.eval()
-predictor_long.eval()
-for p in encoder.parameters():        p.requires_grad = False
-for p in predictor_short.parameters(): p.requires_grad = False
-for p in predictor_long.parameters():  p.requires_grad = False
-
-print("→ Encoder and both predictors are loaded and frozen.")
-
-# ========= Step 2: 读取并准备训练/验证/测试数据 =========
-print("\n[Step 2] Loading patch data...")
-
-# 训练集
-npz_train = np.load(PATCH_FILE)
-ctx_long_train  = prepare_batched_tensor(npz_train['long_term_context'],  BATCH_SIZE)  # [B, N_ctx, 30,3]
-fut_long_train  = prepare_batched_tensor(npz_train['long_term_future'],   BATCH_SIZE)  # [B, N_fut, 30,3]
-
-# 验证集
-npz_val = np.load(VAL_FILE)
-ctx_long_val  = prepare_batched_tensor(npz_val['long_term_context'],  BATCH_SIZE)
-fut_long_val  = prepare_batched_tensor(npz_val['long_term_future'],   BATCH_SIZE)
-
-# 测试集
-npz_test = np.load(TEST_FILE)
-ctx_long_test  = prepare_batched_tensor(npz_test['long_term_context'],  BATCH_SIZE)
-fut_long_test  = prepare_batched_tensor(npz_test['long_term_future'],   BATCH_SIZE)
-
-print(f"ctx_long_train:  {tuple(ctx_long_train.shape)}, fut_long_train:  {tuple(fut_long_train.shape)}")
-print(f"ctx_long_val:    {tuple(ctx_long_val.shape)},   fut_long_val:    {tuple(fut_long_val.shape)}")
-print(f"ctx_long_test:   {tuple(ctx_long_test.shape)},  fut_long_test:   {tuple(fut_long_test.shape)}")
-
-# ========= Step 3: 预先计算 latent-space 预测（仅一次） =========
-print("\n[Step 3] Precomputing latent predictions for training/validation/test ...")
-
-with torch.no_grad():
-    # 3.a) 把 context 送进 encoder 得到 z_ctx（[B, N_ctx, latent_dim]）
-    z_ctx_train  = encoder(ctx_long_train)  # 使用 long-term context
-    z_ctx_val    = encoder(ctx_long_val)
-    z_ctx_test   = encoder(ctx_long_test)
-
-    # 3.b) 把 fut patches 也转为 latent
-    z_fut_train  = encoder(fut_long_train)  # [B, N_fut, latent_dim]
-    z_fut_val    = encoder(fut_long_val)
-    z_fut_test   = encoder(fut_long_test)
-
-    # 3.c) predictor_long 直接预测 "所有 future latent"：
-    z_pred_train_full, _ = predictor_long(z_ctx_train, z_fut_train)
-    z_pred_val_full,   _ = predictor_long(z_ctx_val,   z_fut_val)
-    z_pred_test_full,  _ = predictor_long(z_ctx_test,  z_fut_test)
-
-# z_pred_*_full 的形状均为 [B, N_fut, latent_dim]
-
-
-# ========= Step 4: 定义 ForecastHead，用于把 latent（dim=64）映射回时序 patch（dim=90） =========
-class ForecastHead(nn.Module):
-    def __init__(self, latent_dim, time_steps, num_vars):
-        super().__init__()
-        self.time_steps = time_steps
-        self.num_vars = num_vars
-        # 每个变量一个独立的小 Head，只预测 30 步
-        self.heads = nn.ModuleList([
-            nn.Linear(latent_dim, time_steps) for _ in range(num_vars)
-        ])
-
-    def forward(self, z):
-        """
-        z: [B*N, latent_dim]
-        返回: [B*N, time_steps, num_vars]
-        """
-        # 每个 head 输出 [B*N, 30]，然后拼成 [B*N, 30, 137]
-        preds = [head(z).unsqueeze(-1) for head in self.heads]  # [(B*N, 30, 1)] * 137
-        return torch.cat(preds, dim=-1)  # [B*N, 30, 137]
-
-
-# 初始化 ForecastHead
-forecast_head = ForecastHead(
-    latent_dim=LATENT_DIM,
-    time_steps=PATCH_LENGTH,  # 30
-    num_vars=NUM_VARS         # 137
-)
-optimizer = torch.optim.Adam(forecast_head.parameters(), lr=LEARNING_RATE)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer, mode='min', factor=0.5, patience=5, verbose=True
-)
-loss_fn = nn.MSELoss()
-
-
-# ========= Step 5: 将 "[B, N_fut, latent_dim]" 展平成 "[B*N_fut, latent_dim]"，以及对应目标 "[B*N_fut, 30, 137]" =========
-def flatten_for_head(z_pred_full, fut_patches):
-    """
-    输入：
-      - z_pred_full: [B, N_fut, latent_dim]
-      - fut_patches: [B, N_fut, T, F]
-    返回：
-      - z_flat:  [B*N_fut, latent_dim]
-      - y_flat:  [B*N_fut, T, F]
-    """
-    B, N_fut, D = z_pred_full.shape
-    # flatten latent
-    z_flat = z_pred_full.view(B * N_fut, D)  # [B*N_fut, latent_dim]
-    # reshape 真实值到三维
-    y_flat = fut_patches.view(B * N_fut, PATCH_LENGTH, NUM_VARS)  # [B*N_fut, 30, 137]
-    return z_flat, y_flat
-
-# 训练集、验证集的平坦化
-z_train_flat,  y_train_flat  = flatten_for_head(z_pred_train_full, fut_long_train)
-z_val_flat,    y_val_flat    = flatten_for_head(z_pred_val_full,   fut_long_val)
-# 测试集的平坦化
-z_test_flat,   y_test_flat   = flatten_for_head(z_pred_test_full,  fut_long_test)
-
-print(f"\n→ z_train_flat: {tuple(z_train_flat.shape)},  y_train_flat: {tuple(y_train_flat.shape)}")
-print(f"→ z_val_flat:   {tuple(z_val_flat.shape)},    y_val_flat:   {tuple(y_val_flat.shape)}")
-print(f"→ z_test_flat:  {tuple(z_test_flat.shape)},   y_test_flat:   {tuple(y_test_flat.shape)}")
-
-# ========= Step 6: 划分 ForecastHead 的训练/验证 split（如 75% 训练，25% 验证） =========
-num_train = z_train_flat.size(0)
-# 按 75%/25% 随机划分
-idx = torch.randperm(num_train)
-n_tr = int(num_train * 0.75)
-train_idx = idx[:n_tr]
-val_idx   = idx[n_tr:]
-
-z_head_tr, y_head_tr = z_train_flat[train_idx], y_train_flat[train_idx]
-z_head_va, y_head_va = z_train_flat[val_idx],   y_train_flat[val_idx]
-
-print(f"\n[Step 6] ForecastHead train/val split: {z_head_tr.shape[0]} 训练样本, {z_head_va.shape[0]} 验证样本")
-
-
-# ========= Step 7: 训练 ForecastHead =========
-print("\n[Step 7] Training ForecastHead ...")
-
-train_losses = []
-val_losses   = []
-best_val_loss    = float('inf')
-patience_counter = 0
-
-for epoch in range(1, EPOCHS + 1):
-    ## --- (1) 训练一步 ---
-    forecast_head.train()
-    optimizer.zero_grad()
-    pred_tr = forecast_head(z_head_tr)    # shape [n_tr, 30, 137]
-    loss_tr = loss_fn(pred_tr, y_head_tr)  # 直接在三维上计算 MSE
-    loss_tr.backward()
-    optimizer.step()
-    train_losses.append(loss_tr.item())
-
-    ## --- (2) 验证一步 ---
-    forecast_head.eval()
+def overfit_test(focus_head, encoder, train_loader, num_epochs=100):
+    """在单个batch上测试FocusHead的过拟合能力"""
+    print("\n[Overfit Test] Starting overfit test on a single batch...")
+    
+    # 获取第一个batch
+    x_batch, y_batch = next(iter(train_loader))
+    y_batch = y_batch.to(DEVICE)
+    
+    # 获取latent表示
     with torch.no_grad():
-        pred_va = forecast_head(z_head_va)
-        loss_va = loss_fn(pred_va, y_head_va)
-        val_losses.append(loss_va.item())
-        scheduler.step(loss_va)
+        tgt_latent = encoder(y_batch)
+    
+    # 打印latent的统计信息
+    print(f"Latent stats - Mean: {tgt_latent.mean().item():.6f}, Std: {tgt_latent.std().item():.6f}")
+    print(f"First patch latent (first 5 dims): {tgt_latent[0, 0, :5].cpu().numpy()}")
+    
+    # 准备优化器和损失函数
+    optimizer = torch.optim.Adam(focus_head.parameters(), lr=1e-4)
+    criterion = nn.MSELoss()
+    
+    # 记录原始数据的统计信息
+    print(f"\nOriginal y_batch stats:")
+    print(f"Mean: {y_batch.mean().item():.6f}")
+    print(f"Std: {y_batch.std().item():.6f}")
+    print(f"Min: {y_batch.min().item():.6f}")
+    print(f"Max: {y_batch.max().item():.6f}")
+    
+    # 开始过拟合训练
+    focus_head.train()
+    for epoch in range(num_epochs):
+        optimizer.zero_grad()
+        pred_values = focus_head(tgt_latent)
+        loss = criterion(pred_values, y_batch)
+        loss.backward()
+        optimizer.step()
+        
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item():.6f}")
+            
+            # 每10个epoch打印一次预测值和真实值的统计信息
+            with torch.no_grad():
+                print(f"Pred stats - Mean: {pred_values.mean().item():.6f}, Std: {pred_values.std().item():.6f}")
+                print(f"True stats - Mean: {y_batch.mean().item():.6f}, Std: {y_batch.std().item():.6f}")
+                
+                # 打印第一个patch的第一个变量的时间序列
+                if epoch == 0 or epoch == num_epochs - 1:
+                    print("\nFirst patch, first variable comparison:")
+                    print("Pred:", pred_values[0, 0, :, 0].cpu().numpy())
+                    print("True:", y_batch[0, 0, :, 0].cpu().numpy())
+    
+    return focus_head
 
-        # Early stopping
-        if loss_va < best_val_loss - EARLY_STOPPING_DELTA:
-            best_val_loss = loss_va.item()
-            torch.save(forecast_head.state_dict(), 'model/best_forecast_head.pt')
-            patience_counter = 0
-        else:
-            patience_counter += 1
+# ========= Step 0: 准备 DataLoader =========
+print("[Step 0] Preparing DataLoaders (for downstream)...")
+train_loader = create_patch_loader(PATCH_FILE_TRAIN, BATCH_SIZE, shuffle=True)
+val_loader   = create_patch_loader(PATCH_FILE_VAL,   BATCH_SIZE, shuffle=False)
+test_loader  = create_patch_loader(PATCH_FILE_TEST,  BATCH_SIZE, shuffle=False)
+print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)} | Test batches: {len(test_loader)}\n")
 
-    print(f"[Epoch {epoch:02d}] Train MSE={loss_tr.item():.6f} | Val MSE={loss_va.item():.6f}")
+# ========= Step 1: 加载已训练好的 JEPA 模型（Encoder + Predictor） =========
+print("[Step 1] Loading pretrained JEPA model...")
+checkpoint = torch.load("model/jepa_best.pt", map_location=DEVICE)
 
-# 加载最优权重
-forecast_head.load_state_dict(torch.load('model/best_forecast_head.pt'))
-print("[Step 7] Best ForecastHead loaded.")
+# 实例化 Encoder 和 Predictor，并载入权重
+encoder = MyTimeSeriesEncoder(
+    patch_length=PATCH_LENGTH,
+    num_vars=NUM_VARS,
+    latent_dim=LATENT_DIM,
+    num_layers=2,
+    num_attention_heads=2,
+).to(DEVICE)
+encoder.load_state_dict(checkpoint["encoder_state_dict"])
+encoder.eval()
+for param in encoder.parameters():
+    param.requires_grad = False
 
+predictor = JEPPredictor(
+    latent_dim=LATENT_DIM,
+    context_length=None,
+    prediction_length=None,
+    num_layers=4,
+    num_heads=4
+).to(DEVICE)
+predictor.load_state_dict(checkpoint["predictor_state_dict"])
+predictor.eval()
+for param in predictor.parameters():
+    param.requires_grad = False
 
-# ========= Step 8: 测试时用 long-term predictor 预测 + ForecastHead 再映射回时序，计算指标 =========
-print("\n[Step 8] Evaluating on test set (long-term predictor) ...")
-forecast_head.eval()
+print(f"Loaded JEPA Encoder and Predictor (latent_dim={LATENT_DIM}).\n")
+
+# ========= Step 2: 定义 Focus Head =========
+# Focus Head 用于将 latent 表示"还原"到真实的数值 patch
+class FocusHead(nn.Module):
+    def __init__(self, latent_dim, patch_length, num_vars, hidden_dim=512):  # 增加hidden_dim到512
+        super().__init__()
+        self.fc1 = nn.Linear(latent_dim, hidden_dim)
+        self.act = nn.GELU()  # 使用GELU激活函数
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)  # 增加一层
+        self.fc3 = nn.Linear(hidden_dim, patch_length * num_vars)
+        
+    def forward(self, latent):
+        B, N, D = latent.shape
+        flat = latent.view(B * N, D)
+        h = self.act(self.fc1(flat))
+        h = self.act(self.fc2(h))  # 第二层
+        out = self.fc3(h)
+        return out.view(B, N, PATCH_LENGTH, NUM_VARS)
+
+focus_head = FocusHead(LATENT_DIM, PATCH_LENGTH, NUM_VARS, hidden_dim=512).to(DEVICE)
+
+# 先进行过拟合测试
+focus_head = overfit_test(focus_head, encoder, train_loader)
+
+# 如果过拟合测试成功，继续正常训练
+optimizer_fh = torch.optim.AdamW(  # 使用AdamW优化器
+    focus_head.parameters(), 
+    lr=LEARNING_RATE_FH,
+    weight_decay=WEIGHT_DECAY
+)
+
+# 添加学习率调度器
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer_fh, 
+    mode="min", 
+    factor=0.5, 
+    patience=5,  # 增加patience
+    verbose=True
+)
+
+criterion = nn.MSELoss()
+
+print("[Step 2] Focus Head initialized with improved architecture.\n")
+
+# ========= Step 3: 训练 Focus Head =========
+print("[Step 3] Training Focus Head on true latent → real-value mapping...")
+best_val_loss = float("inf")
+patience = 0
+max_patience = 10  # 增加早停的耐心值
+
+for epoch in range(1, EPOCHS_FOCUS + 1):
+    focus_head.train()
+    running_loss = 0.0
+    samples = 0
+
+    for x_batch, y_batch in train_loader:
+        y_batch = y_batch.to(DEVICE)
+
+        with torch.no_grad():
+            tgt_latent = encoder(y_batch)
+
+        pred_values = focus_head(tgt_latent)
+        loss = criterion(pred_values, y_batch)
+        
+        optimizer_fh.zero_grad()
+        loss.backward()
+        optimizer_fh.step()
+
+        B, N_tgt, _, _ = y_batch.shape
+        running_loss += loss.item() * (B * N_tgt)
+        samples += (B * N_tgt)
+
+    avg_train_loss = running_loss / samples
+
+    # 验证集上验证
+    focus_head.eval()
+    running_val_loss = 0.0
+    val_samples = 0
+
+    with torch.no_grad():
+        for x_batch, y_batch in val_loader:
+            y_batch = y_batch.to(DEVICE)
+            tgt_latent = encoder(y_batch)
+            pred_values = focus_head(tgt_latent)
+            loss = criterion(pred_values, y_batch)
+
+            B, N_tgt, _, _ = y_batch.shape
+            running_val_loss += loss.item() * (B * N_tgt)
+            val_samples += (B * N_tgt)
+
+    avg_val_loss = running_val_loss / val_samples
+    
+    # 更新学习率调度器
+    scheduler.step(avg_val_loss)
+
+    print(f"[Epoch {epoch:02d}] Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
+
+    # 改进的 Early Stopping
+    if avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
+        patience = 0
+        torch.save(focus_head.state_dict(), "model/focus_head_best.pt")
+    else:
+        patience += 1
+        if patience >= max_patience:
+            print(f"Early stopping Focus Head at epoch {epoch}")
+            break
+
+print("\n[Focus Head training completed] Best Val Loss: {:.6f}\n".format(best_val_loss))
+
+# ========= Step 4: 下游任务评估 （修正版） =========
+print("[Step 4] Evaluating JEPA + Focus Head on downstream forecasting...")
+
+# 载入最佳 Focus Head
+focus_head.load_state_dict(torch.load("model/focus_head_best.pt", map_location=DEVICE))
+focus_head.eval()
+
+# 准备 MSE 和 MAE：使用 sum 模式先累计所有元素（patch 内每个值）的误差
+mse_sum_fn = nn.MSELoss(reduction="sum")
+mae_sum_fn = nn.L1Loss(reduction="sum")
+
+total_mse = 0.0
+total_mae = 0.0
+total_elements = 0  # 用来统计"元素"总数： = B * N_tgt * PATCH_LENGTH * NUM_VARS
+
 with torch.no_grad():
-    # Long-term predictor evaluation
-    z_ctx_test_long = encoder(ctx_long_test)
-    z_fut_test_long = encoder(fut_long_test)
-    z_pred_test_long, _ = predictor_long(z_ctx_test_long, z_fut_test_long)
-    
-    # Flatten tensors for ForecastHead
-    z_pred_test_long_flat = z_pred_test_long.view(-1, LATENT_DIM)  # [B*N, D]
-    y_test_3d = fut_long_test.view(-1, PATCH_LENGTH, NUM_VARS)  # [B*N, 30, 137]
-    
-    # Pass through ForecastHead
-    pred_test_3d_long = forecast_head(z_pred_test_long_flat)  # [B*N, 30, 137]
-    
-    # Compute metrics in normalized space
-    metrics_long = compute_metrics(pred_test_3d_long, y_test_3d)
-    print("Long-term predictor → ForecastHead 预测结果 (归一化空间)：")
-    print(f"  MSE = {metrics_long['mse']:.6f}, MAE = {metrics_long['mae']:.6f}")
-    
-    # Compute metrics in original space
-    means, stds = load_statistics(STATS_FILE)
-    pred_restored = pred_test_3d_long * stds + means
-    y_restored = y_test_3d * stds + means
-    metrics_long_restored = compute_metrics(pred_restored, y_restored)
-    print("Long-term predictor → ForecastHead 预测结果 (原始空间)：")
-    print(f"  MSE = {metrics_long_restored['mse']:.6f}, MAE = {metrics_long_restored['mae']:.6f}")
+    for x_batch, y_batch in test_loader:
+        x_batch = x_batch.to(DEVICE)   # (B, N_ctx, PATCH_LENGTH, NUM_VARS)
+        y_batch = y_batch.to(DEVICE)   # (B, N_tgt, PATCH_LENGTH, NUM_VARS)
 
-    # Short-term predictor evaluation
-    z_ctx_test_short = encoder(ctx_long_test)
-    z_fut_test_short = encoder(fut_long_test)
-    z_pred_test_short, _ = predictor_short(z_ctx_test_short, z_fut_test_short)
-    
-    # Flatten tensors for ForecastHead
-    z_pred_test_short_flat = z_pred_test_short.view(-1, LATENT_DIM)  # [B*N, D]
-    
-    # Pass through ForecastHead
-    pred_test_3d_short = forecast_head(z_pred_test_short_flat)  # [B*N, 30, 137]
-    
-    # Compute metrics in normalized space
-    metrics_short = compute_metrics(pred_test_3d_short, y_test_3d)
-    print("Short-term predictor → ForecastHead 预测结果 (归一化空间)：")
-    print(f"  MSE = {metrics_short['mse']:.6f}, MAE = {metrics_short['mae']:.6f}")
-    
-    # Compute metrics in original space
-    pred_restored = pred_test_3d_short * stds + means
-    metrics_short_restored = compute_metrics(pred_restored, y_restored)
-    print("Short-term predictor → ForecastHead 预测结果 (原始空间)：")
-    print(f"  MSE = {metrics_short_restored['mse']:.6f}, MAE = {metrics_short_restored['mae']:.6f}")
+        # 1) 编码上下文 patch
+        ctx_latent = encoder(x_batch)  # (B, N_ctx, latent_dim)
 
+        # 2) Teacher-forcing 下预测未来 latent
+        tgt_latent = encoder(y_batch)  # (B, N_tgt, latent_dim)
+        pred_latent, _ = predictor(ctx_latent, tgt_latent)  # (B, N_tgt, latent_dim)
 
-# ========= Step 9: 可视化 ForecastHead 的训练曲线 =========
-print("\n[Step 9] Plotting ForecastHead training history ...")
-plt.figure(figsize=(10,6))
-plt.plot(train_losses, label='Train MSE')
-plt.plot(val_losses,   label='Val MSE')
-plt.title("ForecastHead Training Curve")
-plt.xlabel("Epoch")
-plt.ylabel("MSE Loss")
-plt.legend()
-plt.grid(True)
+        # 3) Focus Head 将 pred_latent → 预测值
+        pred_values = focus_head(pred_latent)  # (B, N_tgt, PATCH_LENGTH, NUM_VARS)
 
-plt.show()
+        # 4) 计算 MSE 和 MAE：sum 模式先累计所有元素
+        mse_batch = mse_sum_fn(pred_values, y_batch).item()
+        mae_batch = mae_sum_fn(pred_values, y_batch).item()
 
-# ========= 全部完成 =========
-print("\nAll done! 😊")
+        B, N_tgt, _, _ = y_batch.shape
+        elements_in_batch = B * N_tgt * PATCH_LENGTH * NUM_VARS
+
+        total_mse += mse_batch
+        total_mae += mae_batch
+        total_elements += elements_in_batch
+
+# 最终的 avg MSE/MAE = 总误差 / 元素总数
+avg_test_mse = total_mse / total_elements
+avg_test_mae = total_mae / total_elements
+
+print(f"\n[Test Set] Downstream Forecasting — per-element MSE: {avg_test_mse:.6f}, per-element MAE: {avg_test_mae:.6f}")
