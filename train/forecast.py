@@ -1,98 +1,103 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
-"""
-forecast.py
-
-下游任务：使用已训练好的 JEPA 模型（Encoder + Predictor）在 latent 空间进行未来序列预测，
-并通过训练一个 FocusHead 将预测得到的 latent 恢复回真实 patch 值。最后在测试集上评估下游
-预测性能（原始值空间的 MSE/MAE）。
-
-新增要求：仅当训练集 Loss 和验证集 Loss 都足够小（即同时刷新最佳值）时，才保存 FocusHead 模型。
-"""
-
-import os
 import sys
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
+import os
 
-# 若项目根目录不在 sys.path，则将其添加
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
 
 from patch_loader import create_patch_loader
 from jepa.encoder import MyTimeSeriesEncoder
 from jepa.predictor import JEPPredictor
 
-# ========== 全局设置 ==========
+# ========= 全局设置 =========
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 BATCH_SIZE               = 64
 LATENT_DIM               = 256
-EPOCHS_FOCUS             = 40
-LEARNING_RATE_FH         = 5e-4
-WEIGHT_DECAY             = 1e-6
-EARLY_STOPPING_PATIENCE  = 10
+PATCH_LENGTH             = 16
+NUM_VARS                 = 137
 
+# 用于训练 ForecastHead 的超参数（极简网络、超低学习率）
+HEAD_EPOCHS              = 50
+HEAD_LR                  = 1e-5
+WEIGHT_DECAY_HEAD        = 1e-6
+EARLY_STOPPING_PATIENCE  = 15
+EARLY_STOPPING_DELTA     = 1e-6
+
+# 数据路径 & 模型路径
 PATCH_FILE_TRAIN         = "data/SOLAR/patches/solar_train.npz"
 PATCH_FILE_VAL           = "data/SOLAR/patches/solar_val.npz"
 PATCH_FILE_TEST          = "data/SOLAR/patches/solar_test.npz"
 
-PATCH_LENGTH             = 16
-NUM_VARS                 = 137
+# 之前训练好的 JEPA 模型检查点（包含 encoder 与 predictor 权重）
+JEPA_CHECKPOINT_PATH     = "model/jepa_best.pt"
+# 训练完成后保存 ForecastHead 的文件
+FORECAST_HEAD_PATH       = "model/forecast_head_best.pt"
 
-# ========== FocusHead 定义 ==========
-class FocusHead(nn.Module):
+
+# ========= ForecastHead 定义（双隐层，确保有足够容量） =========
+class ForecastHead(nn.Module):
     """
-    将 JEPA 预测得到的 latent 映射回原始 patch 值。
-    输入：pred_latent (B, N_tgt, latent_dim)
-    输出：patch_values  (B, N_tgt, PATCH_LENGTH, NUM_VARS)
+    将 latent 向量映射回原始 patch 空间 (PATCH_LENGTH × NUM_VARS)。
+    输入 shape = (batch_size, num_patches, LATENT_DIM)
+    输出 shape = (batch_size, num_patches, PATCH_LENGTH, NUM_VARS)
     """
-    def __init__(self, latent_dim, patch_length, num_vars, hidden_dim=512):
+    def __init__(self, latent_dim: int, patch_length: int, num_vars: int):
         super().__init__()
-        self.fc1 = nn.Linear(latent_dim, hidden_dim)
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
-        self.act = nn.GELU()
-        self.dropout1 = nn.Dropout(p=0.1)
+        self.patch_length = patch_length
+        self.num_vars = num_vars
 
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.bn2 = nn.BatchNorm1d(hidden_dim)
-        self.dropout2 = nn.Dropout(p=0.1)
-
-        self.fc3 = nn.Linear(hidden_dim, patch_length * num_vars)
+        # 双隐层网络
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim * 2),
+            nn.ReLU(),
+            nn.Linear(latent_dim * 2, latent_dim),
+            nn.ReLU(),
+            nn.Linear(latent_dim, patch_length * num_vars)
+        )
 
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
-        B, N_tgt, D = latent.shape
-        flat = latent.view(B * N_tgt, D)
-
-        h = self.fc1(flat)
-        h = self.bn1(h)
-        h = self.act(h)
-        h = self.dropout1(h)
-
-        h = self.fc2(h)
-        h = self.bn2(h)
-        h = self.act(h)
-        h = self.dropout2(h)
-
-        out = self.fc3(h)
-        out = out.view(B, N_tgt, PATCH_LENGTH, NUM_VARS)
+        """
+        latent: (B, N, LATENT_DIM)
+        返回: (B, N, PATCH_LENGTH, NUM_VARS)
+        """
+        b, n, ld = latent.shape
+        x = latent.view(b * n, ld)                # (B*N, LATENT_DIM)
+        out = self.net(x)                          # (B*N, PATCH_LENGTH*NUM_VARS)
+        out = out.view(b, n, self.patch_length, self.num_vars)
         return out
 
-def main():
-    # -------- Step 1: 准备 DataLoader --------
-    print("[Step 1] Preparing DataLoaders...")
-    train_loader = create_patch_loader(PATCH_FILE_TRAIN, BATCH_SIZE, shuffle=True)
-    val_loader   = create_patch_loader(PATCH_FILE_VAL,   BATCH_SIZE, shuffle=False)
-    test_loader  = create_patch_loader(PATCH_FILE_TEST,  BATCH_SIZE, shuffle=False)
-    print(f"  → Train batches: {len(train_loader)}, Val batches: {len(val_loader)}, Test batches: {len(test_loader)}\n")
 
-    # -------- Step 2: 加载预训练 JEPA 模型（Encoder + Predictor） --------
-    print("[Step 2] Loading pretrained JEPA model...")
-    checkpoint = torch.load("model/jepa_best.pt", map_location=DEVICE, weights_only=True)
+# ========= 工具函数 =========
+def compute_loss(recon: torch.Tensor, target: torch.Tensor) -> dict:
+    """
+    计算 patch 空间上的 MSE 和 MAE（mean）。
+    recon, target 形状均为 (B, N, PATCH_LENGTH, NUM_VARS)
+    返回: {'mse': mse, 'mae': mae}  # 返回 tensor，不调用 .item()
+    """
+    mse = nn.MSELoss(reduction="mean")(recon, target)
+    mae = nn.L1Loss(reduction="mean")(recon, target)
+    return {'mse': mse, 'mae': mae}
 
+
+def compute_metrics_real(pred: torch.Tensor, target: torch.Tensor) -> dict:
+    """
+    计算真实空间上的 MSE 和 MAE 误差（mean），返回字典。
+    pred, target 形状均为 (B, N, PATCH_LENGTH, NUM_VARS)
+    """
+    mse = nn.MSELoss(reduction="mean")(pred, target)
+    mae = nn.L1Loss(reduction="mean")(pred, target)
+    return {'mse': mse.item(), 'mae': mae.item()}
+
+
+def load_pretrained_encoder(checkpoint_path: str) -> MyTimeSeriesEncoder:
+    """
+    重建并加载已训练好的 Encoder（只需编码部分，不训练该部分）。
+    """
     encoder = MyTimeSeriesEncoder(
         patch_length=PATCH_LENGTH,
         num_vars=NUM_VARS,
@@ -103,199 +108,259 @@ def main():
         ffn_dim=LATENT_DIM * 4,
         dropout=0.1
     ).to(DEVICE)
-    encoder.load_state_dict(checkpoint["encoder_state_dict"])
+
+    ckpt = torch.load(checkpoint_path, map_location=DEVICE)
+    encoder.load_state_dict(ckpt["encoder_state_dict"])
     encoder.eval()
-    for param in encoder.parameters():
-        param.requires_grad = False
+    for p in encoder.parameters():
+        p.requires_grad = False
+
+    return encoder
+
+
+def load_pretrained_jepa(checkpoint_path: str):
+    """
+    重建并加载已训练好的 Encoder 和 Predictor，用于推理阶段。
+    """
+    encoder = MyTimeSeriesEncoder(
+        patch_length=PATCH_LENGTH,
+        num_vars=NUM_VARS,
+        latent_dim=LATENT_DIM,
+        time_layers=2,
+        patch_layers=4,
+        num_attention_heads=8,
+        ffn_dim=LATENT_DIM * 4,
+        dropout=0.1
+    ).to(DEVICE)
 
     predictor = JEPPredictor(
         latent_dim=LATENT_DIM,
-        num_heads=4,
         num_layers=4,
+        num_heads=4,
         ffn_dim=LATENT_DIM * 4,
         dropout=0.1,
-        prediction_length=None  # 训练时只用 teacher forcing
+        prediction_length=None
     ).to(DEVICE)
-    predictor.load_state_dict(checkpoint["predictor_state_dict"])
+
+    ckpt = torch.load(checkpoint_path, map_location=DEVICE)
+    encoder.load_state_dict(ckpt["encoder_state_dict"])
+    predictor.load_state_dict(ckpt["predictor_state_dict"])
+
+    encoder.eval()
     predictor.eval()
-    for param in predictor.parameters():
-        param.requires_grad = False
+    return encoder, predictor
 
-    print(f"  → Loaded encoder/predictor (latent_dim={LATENT_DIM}).\n")
 
-    # -------- Step 3: 定义 FocusHead 并做 Overfit Test --------
-    print("[Step 3] Defining FocusHead and running overfit test...")
-    focus_head = FocusHead(LATENT_DIM, PATCH_LENGTH, NUM_VARS, hidden_dim=512).to(DEVICE)
+def train_and_save_forecast_head():
+    """
+    训练 ForecastHead，将 latent vector 还原为原始 patch 空间并保存到 FORECAST_HEAD_PATH。
+    仅包含一个线性层，学习率极低，保证 loss 充分下降。
+    """
+    # Step 1: 准备 DataLoader
+    print("[Step 1] Preparing DataLoaders for head training...")
+    train_loader = create_patch_loader(PATCH_FILE_TRAIN, BATCH_SIZE, shuffle=True)
+    val_loader   = create_patch_loader(PATCH_FILE_VAL,   BATCH_SIZE, shuffle=False)
+    print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
 
-    focus_head.train()
-    print("  → Starting overfit test (single batch)...")
-    x_batch, y_batch = next(iter(train_loader))
-    x_batch = x_batch.to(DEVICE)
-    y_batch = y_batch.to(DEVICE)
+    # Step 2: 加载并冻结 Encoder
+    print("\n[Step 2] Loading pretrained encoder and freezing it...")
+    encoder = load_pretrained_encoder(JEPA_CHECKPOINT_PATH)
+    print("Encoder loaded and frozen. (只用于提取 latent 表示)")
 
-    with torch.no_grad():
-        print("    * Encoding x_batch → ctx_latent")
-        ctx_latent = encoder(x_batch)    # (B, N_ctx, D)
-        print("    * Encoding y_batch → tgt_latent")
-        tgt_latent = encoder(y_batch)    # (B, N_tgt, D)
-        print("    * Predictor forward → pred_latent")
-        pred_latent, _ = predictor(ctx_latent, tgt_latent)  # (B, N_tgt, D)
+    # Step 3: 初始化 ForecastHead
+    print("\n[Step 3] Initializing ForecastHead...")
+    head = ForecastHead(
+        latent_dim=LATENT_DIM,
+        patch_length=PATCH_LENGTH,
+        num_vars=NUM_VARS
+    ).to(DEVICE)
 
-    print(f"    - pred_latent mean={pred_latent.mean().item():.6f}, std={pred_latent.std().item():.6f}")
-    print(f"    - y_batch mean={y_batch.mean().item():.6f}, std={y_batch.std().item():.6f}")
-
-    overfit_optimizer = torch.optim.Adam(focus_head.parameters(), lr=1e-4)
-    overfit_criterion = nn.MSELoss()
-    for epoch in range(1, 31):
-        overfit_optimizer.zero_grad()
-        pred_values = focus_head(pred_latent)
-        loss_of = overfit_criterion(pred_values, y_batch)
-        loss_of.backward()
-        overfit_optimizer.step()
-        if epoch % 10 == 0:
-            with torch.no_grad():
-                print(f"    [Overfit Epoch {epoch:02d}] Loss: {loss_of.item():.6f} | "
-                      f"pred_values mean={pred_values.mean().item():.6f}, std={pred_values.std().item():.6f}")
-    print("  → Overfit test completed.\n")
-
-    # -------- Step 4: 训练 FocusHead（downstream） --------
-    print("[Step 4] Training FocusHead on predicted latent → real patch mapping...")
-    focus_head.train()
-    optimizer_fh = torch.optim.AdamW(
-        focus_head.parameters(),
-        lr=LEARNING_RATE_FH,
-        weight_decay=WEIGHT_DECAY
+    optimizer = torch.optim.AdamW(
+        head.parameters(),
+        lr=HEAD_LR,
+        weight_decay=WEIGHT_DECAY_HEAD
     )
-    scheduler_fh = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer_fh,
-        mode="min",
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode='min',
         factor=0.5,
-        patience=5
+        patience=3
     )
-    criterion_fh = nn.SmoothL1Loss()  # 或者 nn.MSELoss()
 
-    best_train_loss = float("inf")
-    best_val_loss = float("inf")
-    patience = 0
+    best_total_loss = float('inf')
+    patience_counter = 0
+    best_state = None
 
-    for epoch in range(1, EPOCHS_FOCUS + 1):
-        print(f"\n  >>> [Epoch {epoch:02d}] Starting training loop...")
-        focus_head.train()
-        running_train_loss = 0.0
-        train_samples = 0
+    print("\n[Step 4] Training ForecastHead...")
+    for epoch in range(1, HEAD_EPOCHS + 1):
+        head.train()
+        running_train_mse = 0.0
+        running_train_mae = 0.0
+        train_batches = 0
 
-        # ——— 训练集循环 ———
-        print("    * Training on train_loader...")
-        for batch_idx, (x_batch, y_batch) in enumerate(train_loader, 1):
-            x_batch = x_batch.to(DEVICE)
+        for _, y_batch in train_loader:
+            # y_batch: (B, N, PATCH_LENGTH, NUM_VARS)
             y_batch = y_batch.to(DEVICE)
 
+            # 用 y_batch 提取 latent（不计算 grad）
             with torch.no_grad():
-                ctx_latent = encoder(x_batch)
-                tgt_latent = encoder(y_batch)
-                pred_latent, _ = predictor(ctx_latent, tgt_latent)
+                latent_y = encoder(y_batch)  # (B, N, LATENT_DIM)
 
-            pred_values = focus_head(pred_latent)
-            loss = criterion_fh(pred_values, y_batch)
+            pred_patch = head(latent_y)      # (B, N, PATCH_LENGTH, NUM_VARS)
 
-            optimizer_fh.zero_grad()
+            metrics = compute_loss(pred_patch, y_batch)
+            loss = metrics['mse']  # 使用 MSE 作为训练损失
+            optimizer.zero_grad()
             loss.backward()
-            optimizer_fh.step()
+            optimizer.step()
 
-            B, N_tgt, _, _ = y_batch.shape
-            running_train_loss += loss.item() * (B * N_tgt)
-            train_samples += (B * N_tgt)
+            running_train_mse += metrics['mse'].item()
+            running_train_mae += metrics['mae'].item()
+            train_batches += 1
 
-            if batch_idx % 20 == 0:
-                print(f"      [Batch {batch_idx}/{len(train_loader)}] partial train loss = {loss.item():.6f}")
+        avg_train_mse = running_train_mse / train_batches
+        avg_train_mae = running_train_mae / train_batches
 
-        avg_train_loss = running_train_loss / train_samples
-        print(f"    → Finished training epoch {epoch}, avg_train_loss = {avg_train_loss:.6f}")
+        # 验证阶段
+        head.eval()
+        running_val_mse = 0.0
+        running_val_mae = 0.0
+        val_batches = 0
 
-        # ——— 验证集循环 ———
-        print("    * Validating on val_loader...")
-        focus_head.eval()
-        running_val_loss = 0.0
-        val_samples = 0
         with torch.no_grad():
-            for batch_idx, (x_batch, y_batch) in enumerate(val_loader, 1):
-                x_batch = x_batch.to(DEVICE)
+            for _, y_batch in val_loader:
                 y_batch = y_batch.to(DEVICE)
+                latent_y = encoder(y_batch)       # (B, N, LATENT_DIM)
+                pred_patch = head(latent_y)        # (B, N, PATCH_LENGTH, NUM_VARS)
 
-                ctx_latent = encoder(x_batch)
-                tgt_latent = encoder(y_batch)
-                pred_latent, _ = predictor(ctx_latent, tgt_latent)
-                pred_values = focus_head(pred_latent)
-                loss = criterion_fh(pred_values, y_batch)
+                metrics = compute_loss(pred_patch, y_batch)
+                running_val_mse += metrics['mse'].item()
+                running_val_mae += metrics['mae'].item()
+                val_batches += 1
 
-                B, N_tgt, _, _ = y_batch.shape
-                running_val_loss += loss.item() * (B * N_tgt)
-                val_samples += (B * N_tgt)
+        avg_val_mse = running_val_mse / val_batches
+        avg_val_mae = running_val_mae / val_batches
+        
+        # 计算总损失（训练 + 验证）
+        total_loss = avg_train_mse + avg_val_mse
 
-                if batch_idx % 10 == 0:
-                    print(f"      [Val Batch {batch_idx}/{len(val_loader)}] partial val loss = {loss.item():.6f}")
-
-        avg_val_loss = running_val_loss / val_samples
-        print(f"    → Finished validation epoch {epoch}, avg_val_loss = {avg_val_loss:.6f}")
-        print(f"    → Current learning rate: {scheduler_fh.optimizer.param_groups[0]['lr']:.6f}")
-
-        scheduler_fh.step(avg_val_loss)
-
-        # —— 模型保存逻辑 —— 
-        if avg_train_loss < best_train_loss and avg_val_loss < best_val_loss:
-            best_train_loss = avg_train_loss
-            best_val_loss = avg_val_loss
-            patience = 0
-            torch.save(focus_head.state_dict(), "model/focus_head_best.pt")
-            print(f"    → Saved FocusHead (train_loss={best_train_loss:.6f}, val_loss={best_val_loss:.6f})")
+        # 基于总损失进行早停判断
+        if total_loss < best_total_loss - EARLY_STOPPING_DELTA:
+            best_total_loss = total_loss
+            patience_counter = 0
+            best_state = {
+                'head_state_dict': head.state_dict(),
+                'epoch': epoch,
+                'train_mse': avg_train_mse,
+                'train_mae': avg_train_mae,
+                'val_mse': avg_val_mse,
+                'val_mae': avg_val_mae,
+                'total_loss': total_loss
+            }
         else:
-            patience += 1
-            if patience >= EARLY_STOPPING_PATIENCE:
-                print(f"  >>> Early stopping triggered at epoch {epoch}")
+            patience_counter += 1
+            if patience_counter >= EARLY_STOPPING_PATIENCE:
+                print(f"\nEarly stopping triggered at epoch {epoch}")
                 break
 
-    print(f"\n[FocusHead training completed] Best Train Loss: {best_train_loss:.6f}, Best Val Loss: {best_val_loss:.6f}\n")
+        scheduler.step(total_loss)  # 使用总损失来调整学习率
 
-    # -------- Step 5: 下游任务评估（测试集） --------
-    print("[Step 5] Evaluating on downstream forecasting (test set)...")
-    focus_head.load_state_dict(torch.load("model/focus_head_best.pt", map_location=DEVICE))
-    focus_head.eval()
+        print(f"[Epoch {epoch:02d}] "
+              f"Train MSE: {avg_train_mse:.6f} | "
+              f"Train MAE: {avg_train_mae:.6f} | "
+              f"Val MSE: {avg_val_mse:.6f} | "
+              f"Val MAE: {avg_val_mae:.6f} | "
+              f"Total Loss: {total_loss:.6f}")
 
-    mse_sum_fn = nn.MSELoss(reduction="sum")
-    mae_sum_fn = nn.L1Loss(reduction="sum")
+    print("\n[Head Training Completed]")
 
-    total_mse = 0.0
-    total_mae = 0.0
-    total_elements = 0  # B * N_tgt * PATCH_LENGTH * NUM_VARS
+    # Step 5: 保存最优 ForecastHead
+    if best_state is not None:
+        os.makedirs(os.path.dirname(FORECAST_HEAD_PATH), exist_ok=True)
+        torch.save({
+            'forecasthead_state_dict': best_state['head_state_dict'],
+            'patch_length': PATCH_LENGTH,
+            'num_vars': NUM_VARS,
+            'latent_dim': LATENT_DIM,
+            'epoch': best_state['epoch'],
+            'train_mse': best_state['train_mse'],
+            'train_mae': best_state['train_mae'],
+            'val_mse': best_state['val_mse'],
+            'val_mae': best_state['val_mae'],
+            'total_loss': best_state['total_loss']
+        }, FORECAST_HEAD_PATH)
+        print(f"Best ForecastHead saved at '{FORECAST_HEAD_PATH}' (epoch {best_state['epoch']})")
+        print(f"  Train MSE: {best_state['train_mse']:.6f}")
+        print(f"  Train MAE: {best_state['train_mae']:.6f}")
+        print(f"  Val MSE: {best_state['val_mse']:.6f}")
+        print(f"  Val MAE: {best_state['val_mae']:.6f}")
+        print(f"  Total Loss: {best_state['total_loss']:.6f}")
+
+
+def forecast_with_head():
+    """
+    在测试集上运行推理：使用已训练好的 JEPA（Encoder+Predictor）和 ForecastHead
+    将 Predictor 输出的 latent 恢复成真实 patch 并计算误差。
+    """
+    print("[Step 1] Preparing DataLoader for test set…")
+    test_loader = create_patch_loader(PATCH_FILE_TEST, BATCH_SIZE, shuffle=False)
+    print(f"Test batches: {len(test_loader)}")
+
+    print("\n[Step 2] Loading pretrained JEPA (Encoder+Predictor)…")
+    encoder, predictor = load_pretrained_jepa(JEPA_CHECKPOINT_PATH)
+    print("JEPA models loaded.")
+
+    print("\n[Step 3] Loading ForecastHead…")
+    ckpt = torch.load(FORECAST_HEAD_PATH, map_location=DEVICE)
+    forecast_head = ForecastHead(
+        latent_dim = ckpt['latent_dim'],
+        patch_length = ckpt['patch_length'],
+        num_vars = ckpt['num_vars']
+    ).to(DEVICE)
+    forecast_head.load_state_dict(ckpt['forecasthead_state_dict'])
+    forecast_head.eval()
+    print("ForecastHead loaded.")
+
+    print("\n[Step 4] Running inference on test data…")
+    running_test_mse = 0.0
+    running_test_mae = 0.0
+    running_test_total = 0.0
+    test_batches = 0
 
     with torch.no_grad():
-        for batch_idx, (x_batch, y_batch) in enumerate(test_loader, 1):
-            x_batch = x_batch.to(DEVICE)
-            y_batch = y_batch.to(DEVICE)
+        for x_batch, y_batch in test_loader:
+            x_batch = x_batch.to(DEVICE)  # (B, N_context, PATCH_LENGTH, NUM_VARS)
+            y_batch = y_batch.to(DEVICE)  # (B, N_target,  PATCH_LENGTH, NUM_VARS)
 
-            ctx_latent = encoder(x_batch)
-            tgt_latent = encoder(y_batch)
+            # 1) 编码 x_batch, y_batch 到 latent
+            ctx_latent = encoder(x_batch)   # (B, N_context, LATENT_DIM)
+            tgt_latent = encoder(y_batch)   # (B, N_target,  LATENT_DIM)
+
+            # 2) 使用 Predictor 得到 pred_latent
             pred_latent, _ = predictor(ctx_latent, tgt_latent)
-            pred_values = focus_head(pred_latent)
+            #    pred_latent: (B, N_target, LATENT_DIM)
 
-            mse_batch = mse_sum_fn(pred_values, y_batch).item()
-            mae_batch = mae_sum_fn(pred_values, y_batch).item()
+            # 3) 用 ForecastHead 将 pred_latent 恢复到真实 patch 空间
+            pred_real = forecast_head(pred_latent)
+            #    pred_real: (B, N_target, PATCH_LENGTH, NUM_VARS)
 
-            B, N_tgt, _, _ = y_batch.shape
-            elements = B * N_tgt * PATCH_LENGTH * NUM_VARS
+            # 4) 计算与 y_batch 之间的 MSE、MAE
+            metrics = compute_metrics_real(pred_real, y_batch)
+            running_test_mse += metrics['mse']
+            running_test_mae += metrics['mae']
+            running_test_total += metrics['mse'] * y_batch.numel()  # 累加总损失
+            test_batches += 1
 
-            total_mse += mse_batch
-            total_mae += mae_batch
-            total_elements += elements
-
-            if batch_idx % 10 == 0:
-                print(f"    [Test Batch {batch_idx}/{len(test_loader)}] "
-                      f"partialMSE={mse_batch/elements:.6f}, partialMAE={mae_batch/elements:.6f}")
-
-    avg_test_mse = total_mse / total_elements
-    avg_test_mae = total_mae / total_elements
-    print(f"\n[Test Set] Downstream Forecasting — per-element MSE: {avg_test_mse:.6f}, MAE: {avg_test_mae:.6f}\n")
+    avg_test_mse = running_test_mse / test_batches
+    avg_test_mae = running_test_mae / test_batches
+    total_test_loss = running_test_total / test_batches
+    print(f"\n[Test Results]")
+    print(f"  MSE: {avg_test_mse:.6f}")
+    print(f"  MAE: {avg_test_mae:.6f}")
+    print(f"  Total Loss: {total_test_loss:.6f}")
 
 
 if __name__ == "__main__":
-    main()
+    # 先训练 ForecastHead，然后直接进行推理
+    train_and_save_forecast_head()
+    forecast_with_head()
