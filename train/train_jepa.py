@@ -24,6 +24,9 @@ LEARNING_RATE            = 5e-4
 WEIGHT_DECAY            = 1e-6
 EARLY_STOPPING_PATIENCE  = 30
 EARLY_STOPPING_DELTA     = 1e-6
+# 训练集和验证集的权重（用于综合评估）
+TRAIN_WEIGHT            = 0.4  # 训练集权重
+VAL_WEIGHT              = 0.6  # 验证集权重
 
 PATCH_FILE_TRAIN         = "data/SOLAR/patches/solar_train.npz"
 PATCH_FILE_VAL           = "data/SOLAR/patches/solar_val.npz"
@@ -37,10 +40,10 @@ NUM_VARS                 = 137
 def compute_metrics(pred: torch.Tensor, target: torch.Tensor) -> dict:
     """
     计算 MSE 和 MAE 误差
-    pred, target 形状均为 (B, N_patches, PATCH_LENGTH, NUM_VARS)
+    pred, target 形状均为 (B, N, D)
     """
-    mse = nn.MSELoss()(pred, target)
-    mae = nn.L1Loss()(pred, target)
+    mse = nn.MSELoss(reduction='sum')(pred, target)
+    mae = nn.L1Loss(reduction='sum')(pred, target)
     return {'mse': mse.item(), 'mae': mae.item()}
 
 
@@ -125,31 +128,23 @@ for epoch in range(1, EPOCHS + 1):
     train_samples = 0
 
     for x_batch, y_batch in train_loader:
-        # x_batch, y_batch: (B, N_patches, PATCH_LENGTH, NUM_VARS)
         x_batch = x_batch.to(DEVICE)
         y_batch = y_batch.to(DEVICE)
 
         optimizer.zero_grad()
 
-        # 1) 用 Encoder 编码上下文 patch（历史）
-        ctx_latent = encoder(x_batch)  # (B, N_ctx, D)
-        # 2) 用 Encoder 编码目标 patch（未来），作为监督信息
-        tgt_latent = encoder(y_batch)  # (B, N_tgt, D)
-
-        # 3) Predictor 用上下文 latent + 目标 latent 做 teacher-forcing 训练
+        ctx_latent = encoder(x_batch)
+        tgt_latent = encoder(y_batch)
         pred_latent, loss = predictor(ctx_latent, tgt_latent)
 
-        # 4) 反向传播
         loss.backward()
         optimizer.step()
 
-        # 5) 计算并累计训练指标
-        with torch.no_grad():
-            mse_val = nn.MSELoss(reduction='sum')(pred_latent, tgt_latent).item()
-            mae_val = nn.L1Loss(reduction='sum')(pred_latent, tgt_latent).item()
-            running_train_mse += mse_val
-            running_train_mae += mae_val
-            train_samples += pred_latent.numel()
+        # 使用 compute_metrics 计算指标
+        metrics = compute_metrics(pred_latent, tgt_latent)
+        running_train_mse += metrics['mse']
+        running_train_mae += metrics['mae']
+        train_samples += pred_latent.numel()
 
     # 训练集平均误差
     avg_train_mse = running_train_mse / train_samples
@@ -173,10 +168,10 @@ for epoch in range(1, EPOCHS + 1):
             tgt_latent = encoder(y_batch)
             val_pred_latent, _ = predictor(ctx_latent, tgt_latent)
 
-            mse_val = nn.MSELoss(reduction='sum')(val_pred_latent, tgt_latent).item()
-            mae_val = nn.L1Loss(reduction='sum')(val_pred_latent, tgt_latent).item()
-            running_val_mse += mse_val
-            running_val_mae += mae_val
+            # 使用 compute_metrics 计算指标
+            metrics = compute_metrics(val_pred_latent, tgt_latent)
+            running_val_mse += metrics['mse']
+            running_val_mae += metrics['mae']
             val_samples += val_pred_latent.numel()
 
     avg_val_mse = running_val_mse / val_samples
@@ -185,14 +180,19 @@ for epoch in range(1, EPOCHS + 1):
     history['val_mae'].append(avg_val_mae)
 
     # ------ Early Stopping 判断 ------
-    if avg_val_mse < best_val_mse - EARLY_STOPPING_DELTA:
-        best_val_mse = avg_val_mse
+    # 计算综合指标：训练集和验证集的加权和
+    combined_score = TRAIN_WEIGHT * avg_train_mse + VAL_WEIGHT * avg_val_mse
+    
+    if combined_score < best_val_mse - EARLY_STOPPING_DELTA:
+        best_val_mse = combined_score
         patience_counter = 0
         best_state = {
             'encoder': encoder.state_dict(),
             'predictor': predictor.state_dict(),
             'epoch': epoch,
-            'val_mse': avg_val_mse
+            'train_mse': avg_train_mse,
+            'val_mse': avg_val_mse,
+            'combined_score': combined_score
         }
     else:
         patience_counter += 1
@@ -206,7 +206,8 @@ for epoch in range(1, EPOCHS + 1):
     # ------ 打印当前 epoch 信息 ------
     print(f"[Epoch {epoch:02d}] "
           f"Train MSE: {avg_train_mse:.6f}, MAE: {avg_train_mae:.6f} | "
-          f" Val MSE: {avg_val_mse:.6f}, MAE: {avg_val_mae:.6f}")
+          f"Val MSE: {avg_val_mse:.6f}, MAE: {avg_val_mae:.6f} | "
+          f"Combined: {combined_score:.6f}")
 
     # First-epoch shape调试信息
     if epoch == 1:
@@ -226,9 +227,15 @@ if best_state is not None:
         'predictor_state_dict': best_state['predictor'],
         'latent_dim':           LATENT_DIM,
         'patch_length':         PATCH_LENGTH,
-        'num_vars':             NUM_VARS
+        'num_vars':             NUM_VARS,
+        'train_mse':            best_state['train_mse'],
+        'val_mse':              best_state['val_mse'],
+        'combined_score':       best_state['combined_score']
     }, "model/jepa_best.pt")
-    print(f"Best model saved (epoch {best_state['epoch']}), val_mse = {best_state['val_mse']:.6f}")
+    print(f"Best model saved (epoch {best_state['epoch']})")
+    print(f"  Train MSE: {best_state['train_mse']:.6f}")
+    print(f"  Val MSE: {best_state['val_mse']:.6f}")
+    print(f"  Combined Score: {best_state['combined_score']:.6f}")
 
 
 # ========= Step 5: 测试评估（可选） =========
@@ -251,10 +258,10 @@ with torch.no_grad():
         tgt_latent = encoder(y_batch)
         test_pred_latent, _ = predictor(ctx_latent, tgt_latent)
 
-        mse_val = nn.MSELoss(reduction='sum')(test_pred_latent, tgt_latent).item()
-        mae_val = nn.L1Loss(reduction='sum')(test_pred_latent, tgt_latent).item()
-        running_test_mse += mse_val
-        running_test_mae += mae_val
+        # 使用 compute_metrics 计算指标
+        metrics = compute_metrics(test_pred_latent, tgt_latent)
+        running_test_mse += metrics['mse']
+        running_test_mae += metrics['mae']
         test_samples += test_pred_latent.numel()
 
 avg_test_mse = running_test_mse / test_samples
