@@ -17,7 +17,7 @@ from jepa.predictor import JEPPredictor
 # ========= 全局设置 =========
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-BATCH_SIZE               = 32
+BATCH_SIZE               = 64
 LATENT_DIM               = 256
 EPOCHS                   = 100
 LEARNING_RATE            = 5e-4
@@ -59,25 +59,29 @@ print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)} | Te
 # ========= Step 2: 初始化模型 =========
 print("\n[Step 2] Initializing models...")
 
-# Encoder：把每个 (B, N_ctx, T, F) → (B, N_ctx, D)
+# 1) Encoder
 encoder = MyTimeSeriesEncoder(
     patch_length=PATCH_LENGTH,
     num_vars=NUM_VARS,
     latent_dim=LATENT_DIM,
-    num_layers=6,                # 增加到6层
-    num_attention_heads=8,       # 增加到8个头
-    ffn_dim=LATENT_DIM*4,       # 设置FFN维度为latent_dim的4倍
-    dropout=0.1                  # 添加dropout
+    time_layers=2,           # patch 内部时间 Transformer 层数
+    patch_layers=4,          # patch 级别 Transformer 层数
+    num_attention_heads=8,   # 注意力头数
+    ffn_dim=LATENT_DIM*4,    # feed-forward 层维度
+    dropout=0.1              # dropout 比例
 ).to(DEVICE)
 
-# Predictor：把 (B, N_ctx, D) + (B, N_tgt, D) → 输出 (B, N_tgt, D) + loss
+# 2) Predictor
 predictor = JEPPredictor(
     latent_dim=LATENT_DIM,
-    context_length=None,    # 会在 forward 时根据输入自动推断
-    prediction_length=None, # 同上
-    num_layers=4,
-    num_heads=4
+    num_layers=4,            # Transformer 层数
+    num_heads=4,             # 注意力头数
+    ffn_dim=LATENT_DIM*4,    # feed-forward 层维度
+    dropout=0.1,             # dropout 比例
+    prediction_length=None    # 训练时不需要指定预测长度
 ).to(DEVICE)
+
+print(f"Initialized Encoder and Predictor (latent_dim={LATENT_DIM}).\n")
 
 # 优化器：使用AdamW并添加weight decay
 optimizer = torch.optim.AdamW(

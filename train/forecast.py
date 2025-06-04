@@ -32,56 +32,39 @@ PATCH_FILE_TEST  = "data/SOLAR/patches/solar_test.npz"
 PATCH_LENGTH = 16
 NUM_VARS     = 137
 
-def overfit_test(focus_head, encoder, train_loader, num_epochs=100):
-    """在单个batch上测试FocusHead的过拟合能力"""
+def overfit_test(focus_head, encoder, predictor, train_loader, num_epochs=100):
+    """在单个batch上测试FocusHead能否用 pred_latent（带 predictor 噪声）去拟合"""
     print("\n[Overfit Test] Starting overfit test on a single batch...")
-    
-    # 获取第一个batch
     x_batch, y_batch = next(iter(train_loader))
+    x_batch = x_batch.to(DEVICE)
     y_batch = y_batch.to(DEVICE)
-    
-    # 获取latent表示
+
+    # 1) 先编好 ctx_latent 和 tgt_latent
     with torch.no_grad():
-        tgt_latent = encoder(y_batch)
-    
-    # 打印latent的统计信息
-    print(f"Latent stats - Mean: {tgt_latent.mean().item():.6f}, Std: {tgt_latent.std().item():.6f}")
-    print(f"First patch latent (first 5 dims): {tgt_latent[0, 0, :5].cpu().numpy()}")
-    
-    # 准备优化器和损失函数
+        ctx_latent = encoder(x_batch)      # (B, N_ctx, 256)
+        tgt_latent = encoder(y_batch)      # (B, N_tgt, 256)
+        pred_latent, _ = predictor(ctx_latent, tgt_latent)
+
+    print(f"Latent stats (pred_latent) - Mean: {pred_latent.mean().item():.6f}, Std: {pred_latent.std().item():.6f}")
+    print(f"First patch latent (first 5 dims): {pred_latent[0,0,:5].cpu().numpy()}")
+
     optimizer = torch.optim.Adam(focus_head.parameters(), lr=1e-4)
     criterion = nn.MSELoss()
-    
-    # 记录原始数据的统计信息
-    print(f"\nOriginal y_batch stats:")
-    print(f"Mean: {y_batch.mean().item():.6f}")
-    print(f"Std: {y_batch.std().item():.6f}")
-    print(f"Min: {y_batch.min().item():.6f}")
-    print(f"Max: {y_batch.max().item():.6f}")
-    
-    # 开始过拟合训练
     focus_head.train()
     for epoch in range(num_epochs):
         optimizer.zero_grad()
-        pred_values = focus_head(tgt_latent)
+        pred_values = focus_head(pred_latent)     # 用 pred_latent 而非真 latent
         loss = criterion(pred_values, y_batch)
         loss.backward()
         optimizer.step()
-        
-        if (epoch + 1) % 10 == 0:
+        if (epoch+1) % 10 == 0:
             print(f"Epoch {epoch+1}/{num_epochs}, Loss: {loss.item():.6f}")
-            
-            # 每10个epoch打印一次预测值和真实值的统计信息
             with torch.no_grad():
                 print(f"Pred stats - Mean: {pred_values.mean().item():.6f}, Std: {pred_values.std().item():.6f}")
-                print(f"True stats - Mean: {y_batch.mean().item():.6f}, Std: {y_batch.std().item():.6f}")
-                
-                # 打印第一个patch的第一个变量的时间序列
-                if epoch == 0 or epoch == num_epochs - 1:
-                    print("\nFirst patch, first variable comparison:")
-                    print("Pred:", pred_values[0, 0, :, 0].cpu().numpy())
-                    print("True:", y_batch[0, 0, :, 0].cpu().numpy())
-    
+                if epoch == 0 or epoch == num_epochs-1:
+                    print("First patch, first var -- Pred vs True:")
+                    print("Pred:", pred_values[0,0,:,0].cpu().numpy())
+                    print("True:", y_batch[0,0,:,0].cpu().numpy())
     return focus_head
 
 # ========= Step 0: 准备 DataLoader =========
@@ -100,8 +83,10 @@ encoder = MyTimeSeriesEncoder(
     patch_length=PATCH_LENGTH,
     num_vars=NUM_VARS,
     latent_dim=LATENT_DIM,
-    num_layers=2,
-    num_attention_heads=2,
+    num_layers=6,
+    num_attention_heads=8,
+    ffn_dim=LATENT_DIM*4,
+    dropout=0.1
 ).to(DEVICE)
 encoder.load_state_dict(checkpoint["encoder_state_dict"])
 encoder.eval()
@@ -122,28 +107,45 @@ for param in predictor.parameters():
 
 print(f"Loaded JEPA Encoder and Predictor (latent_dim={LATENT_DIM}).\n")
 
-# ========= Step 2: 定义 Focus Head =========
-# Focus Head 用于将 latent 表示"还原"到真实的数值 patch
+# ========= Step 2: 定义增强版 Focus Head =========
 class FocusHead(nn.Module):
-    def __init__(self, latent_dim, patch_length, num_vars, hidden_dim=512):  # 增加hidden_dim到512
+    def __init__(self, latent_dim, patch_length, num_vars, hidden_dim=512):
         super().__init__()
+        # —— 第一层
         self.fc1 = nn.Linear(latent_dim, hidden_dim)
-        self.act = nn.GELU()  # 使用GELU激活函数
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)  # 增加一层
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.act = nn.GELU()
+        self.dropout1 = nn.Dropout(p=0.1)
+
+        # —— 第二层
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        self.dropout2 = nn.Dropout(p=0.1)
+
+        # —— 第三层: 输出 patch_length * num_vars
         self.fc3 = nn.Linear(hidden_dim, patch_length * num_vars)
-        
+
     def forward(self, latent):
         B, N, D = latent.shape
-        flat = latent.view(B * N, D)
-        h = self.act(self.fc1(flat))
-        h = self.act(self.fc2(h))  # 第二层
-        out = self.fc3(h)
+        flat = latent.view(B * N, D)           # (B*N, latent_dim)
+
+        h = self.fc1(flat)                     # (B*N, hidden_dim)
+        h = self.bn1(h)                        # BatchNorm1d 对 (B*N, hidden_dim) 做规范化
+        h = self.act(h)
+        h = self.dropout1(h)
+
+        h = self.fc2(h)                        # (B*N, hidden_dim)
+        h = self.bn2(h)
+        h = self.act(h)
+        h = self.dropout2(h)
+
+        out = self.fc3(h)                      # (B*N, patch_length * num_vars)
         return out.view(B, N, PATCH_LENGTH, NUM_VARS)
 
 focus_head = FocusHead(LATENT_DIM, PATCH_LENGTH, NUM_VARS, hidden_dim=512).to(DEVICE)
 
 # 先进行过拟合测试
-focus_head = overfit_test(focus_head, encoder, train_loader)
+focus_head = overfit_test(focus_head, encoder, predictor, train_loader)
 
 # 如果过拟合测试成功，继续正常训练
 optimizer_fh = torch.optim.AdamW(  # 使用AdamW优化器
@@ -161,12 +163,13 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     verbose=True
 )
 
-criterion = nn.MSELoss()
+# 使用SmoothL1Loss代替MSE
+criterion = nn.SmoothL1Loss()
 
 print("[Step 2] Focus Head initialized with improved architecture.\n")
 
-# ========= Step 3: 训练 Focus Head =========
-print("[Step 3] Training Focus Head on true latent → real-value mapping...")
+# ========= Step 3: 训练 Focus Head（改成用 pred_latent 去拟合） =========
+print("[Step 3] Training Focus Head on predicted latent → real-value mapping...")
 best_val_loss = float("inf")
 patience = 0
 max_patience = 10  # 增加早停的耐心值
@@ -177,14 +180,17 @@ for epoch in range(1, EPOCHS_FOCUS + 1):
     samples = 0
 
     for x_batch, y_batch in train_loader:
+        x_batch = x_batch.to(DEVICE)
         y_batch = y_batch.to(DEVICE)
 
         with torch.no_grad():
-            tgt_latent = encoder(y_batch)
+            ctx_latent = encoder(x_batch)      # (B, N_ctx, 256)
+            tgt_latent = encoder(y_batch)      # (B, N_tgt, 256)
+            pred_latent, _ = predictor(ctx_latent, tgt_latent)  # 使用predictor输出的pred_latent
 
-        pred_values = focus_head(tgt_latent)
+        pred_values = focus_head(pred_latent)    # 用pred_latent去预测
         loss = criterion(pred_values, y_batch)
-        
+
         optimizer_fh.zero_grad()
         loss.backward()
         optimizer_fh.step()
@@ -195,25 +201,24 @@ for epoch in range(1, EPOCHS_FOCUS + 1):
 
     avg_train_loss = running_loss / samples
 
-    # 验证集上验证
+    # 验证集上验证（同样用 pred_latent）
     focus_head.eval()
     running_val_loss = 0.0
     val_samples = 0
-
     with torch.no_grad():
         for x_batch, y_batch in val_loader:
+            x_batch = x_batch.to(DEVICE)
             y_batch = y_batch.to(DEVICE)
+            ctx_latent = encoder(x_batch)
             tgt_latent = encoder(y_batch)
-            pred_values = focus_head(tgt_latent)
+            pred_latent, _ = predictor(ctx_latent, tgt_latent)  # 使用predictor输出的pred_latent
+            pred_values = focus_head(pred_latent)               # 用pred_latent去预测
             loss = criterion(pred_values, y_batch)
-
             B, N_tgt, _, _ = y_batch.shape
             running_val_loss += loss.item() * (B * N_tgt)
             val_samples += (B * N_tgt)
 
     avg_val_loss = running_val_loss / val_samples
-    
-    # 更新学习率调度器
     scheduler.step(avg_val_loss)
 
     print(f"[Epoch {epoch:02d}] Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
