@@ -1,8 +1,6 @@
 import os
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
-import joblib
 from preprocess.datatool import DataTool
 
 # ====== Global Constants ======
@@ -34,7 +32,6 @@ class AnomalyPatchExtractor:
         valid_ratio: float        = VALID_RATIO,
         patch_len: int            = PATCH_LEN,
         patch_stride: int         = PATCH_STRIDE,
-        normalize: bool           = True,  # 新增：是否进行标准化
         debug: bool               = False
     ):
         self.data_tool    = DataTool(filename, debug=debug)
@@ -45,13 +42,11 @@ class AnomalyPatchExtractor:
         self.valid_ratio  = valid_ratio
         self.patch_len    = patch_len
         self.patch_stride = patch_stride
-        self.normalize    = normalize  # 新增：标准化开关
-        self.scaler       = StandardScaler() if normalize else None  # 新增：标准化器
         self.debug        = debug
 
     def _extract_sliding_windows(self, data: np.ndarray) -> tuple:
         """
-        From a standardized multivariate time series (T, C),
+        From a multivariate time series (T, C),
         extract all (input_window, output_window) pairs via sliding window.
 
         Returns:
@@ -114,44 +109,49 @@ class AnomalyPatchExtractor:
         """
         os.makedirs(save_dir, exist_ok=True)
 
-        # 1) Load raw dataset (不使用 DataTool 的标准化)
-        data_raw = self.data_tool.load()  # shape = (T, C)
+        # 1) Load raw dataset
+        data = self.data_tool.load()  # shape = (T, C)
+        
+        if self.debug:
+            print("\n=== Raw Data Sample (First 5 timesteps, first 5 features) ===")
+            print(data[:5, :5])
+            print("\n=== Data Statistics ===")
+            print(f"Mean: {np.mean(data):.4f}")
+            print(f"Std: {np.std(data):.4f}")
+            print(f"Min: {np.min(data):.4f}")
+            print(f"Max: {np.max(data):.4f}")
 
-        # 2) 标准化处理
-        if self.normalize:
-            # 只使用训练部分拟合 scaler
-            T = data_raw.shape[0]
-            train_T = int(T * self.train_ratio)
-            self.scaler.fit(data_raw[:train_T])
-            
-            # 对所有数据应用相同的 transform
-            data = self.scaler.transform(data_raw)
-            
-            # 保存 scaler
-            scaler_path = os.path.join(save_dir, "scaler.pkl")
-            joblib.dump(self.scaler, scaler_path)
-            if self.debug:
-                print(f"\nSaved scaler to: {scaler_path}")
-        else:
-            data = data_raw
-
-        # 3) Extract all sliding windows (x_windows, y_windows)
+        # 2) Extract all sliding windows (x_windows, y_windows)
         x_all, y_all = self._extract_sliding_windows(data)
         N, _, C = x_all.shape
 
-        # 4) Convert each window into patches
+        if self.debug:
+            print("\n=== First Window Sample (First patch, first 5 timesteps, first 5 features) ===")
+            print("Input window:")
+            print(x_all[0, :5, :5])
+            print("\nOutput window:")
+            print(y_all[0, :5, :5])
+
+        # 3) Convert each window into patches
         x_patches_all = self._split_windows_into_patches(x_all)
         y_patches_all = self._split_windows_into_patches(y_all)
 
         if self.debug:
-            print("=== After splitting into patches ===")
+            print("\n=== First Patch Sample (First 5 timesteps, first 5 features) ===")
+            print("Input patch:")
+            print(x_patches_all[0, 0, :5, :5])
+            print("\nOutput patch:")
+            print(y_patches_all[0, 0, :5, :5])
+
+        if self.debug:
+            print("\n=== After splitting into patches ===")
             print(f"x_patches_all shape: {x_patches_all.shape}")
             print(f"y_patches_all shape: {y_patches_all.shape}")
 
-        # 5) Determine train/valid indices over windows
+        # 4) Determine train/valid indices over windows
         (t0, t1), (v0, v1) = self._split_indices(N)
 
-        # 6) Slice patches by index
+        # 5) Slice patches by index
         x_train_patches = x_patches_all[t0:t1]
         y_train_patches = y_patches_all[t0:t1]
 
@@ -162,8 +162,19 @@ class AnomalyPatchExtractor:
             print("\n=== Split patch shapes ===")
             print(f"Train x patches: {x_train_patches.shape}, Train y patches: {y_train_patches.shape}")
             print(f"Valid x patches: {x_valid_patches.shape}, Valid y patches: {y_valid_patches.shape}")
+            print("\n=== Train/Valid Data Statistics ===")
+            print("Train data:")
+            print(f"Mean: {np.mean(x_train_patches):.4f}")
+            print(f"Std: {np.std(x_train_patches):.4f}")
+            print(f"Min: {np.min(x_train_patches):.4f}")
+            print(f"Max: {np.max(x_train_patches):.4f}")
+            print("\nValid data:")
+            print(f"Mean: {np.mean(x_valid_patches):.4f}")
+            print(f"Std: {np.std(x_valid_patches):.4f}")
+            print(f"Min: {np.min(x_valid_patches):.4f}")
+            print(f"Max: {np.max(x_valid_patches):.4f}")
 
-        # 7) Save each split into .npz
+        # 6) Save each split into .npz
         train_path = os.path.join(save_dir, "msl_train.npz")
         valid_path = os.path.join(save_dir, "msl_val.npz")
 
@@ -182,56 +193,67 @@ class AnomalyPatchExtractor:
 
     def extract_test_set(self, test_filename: str = DEFAULT_TEST_FILE, save_dir: str = "data/MSL/patches"):
         """
-        Extract (input, output) patches from MSL test set and save as .npz
+        Extract (input, output) patches from MSL test set
         
         Args:
             test_filename: Path to MSL test set file (default: data/MSL/MSL_test.npy)
             save_dir: Directory to save the test patches (default: data/MSL/patches)
             
         Returns:
-            test_path: Path to the saved test patches file
+            tuple: (x_test_patches, y_test_patches) - The extracted test patches
         """
         os.makedirs(save_dir, exist_ok=True)
 
-        # 1) Load test dataset (不使用 DataTool 的标准化)
+        # 1) Load test dataset
         test_data_tool = DataTool(test_filename, debug=self.debug)
-        test_data_raw = test_data_tool.load()  # shape = (T, C)
+        test_data = test_data_tool.load()  # shape = (T, C)
 
-        # 2) 标准化处理
-        if self.normalize:
-            # 使用训练好的 scaler 转换测试数据
-            test_data = self.scaler.transform(test_data_raw)
-        else:
-            test_data = test_data_raw
+        if self.debug:
+            print("\n=== Test Data Sample (First 5 timesteps, first 5 features) ===")
+            print(test_data[:5, :5])
+            print("\n=== Test Data Statistics ===")
+            print(f"Mean: {np.mean(test_data):.4f}")
+            print(f"Std: {np.std(test_data):.4f}")
+            print(f"Min: {np.min(test_data):.4f}")
+            print(f"Max: {np.max(test_data):.4f}")
 
-        # 3) Extract sliding windows
+        # 2) Extract sliding windows
         x_test, y_test = self._extract_sliding_windows(test_data)
 
-        # 4) Convert windows into patches
+        if self.debug:
+            print("\n=== First Test Window Sample (First patch, first 5 timesteps, first 5 features) ===")
+            print("Input window:")
+            print(x_test[0, :5, :5])
+            print("\nOutput window:")
+            print(y_test[0, :5, :5])
+
+        # 3) Convert windows into patches
         x_test_patches = self._split_windows_into_patches(x_test)
         y_test_patches = self._split_windows_into_patches(y_test)
 
         if self.debug:
+            print("\n=== First Test Patch Sample (First 5 timesteps, first 5 features) ===")
+            print("Input patch:")
+            print(x_test_patches[0, 0, :5, :5])
+            print("\nOutput patch:")
+            print(y_test_patches[0, 0, :5, :5])
             print("\n=== Test patch shapes ===")
             print(f"Test x patches: {x_test_patches.shape}, Test y patches: {y_test_patches.shape}")
+            print("\n=== Test Patches Statistics ===")
+            print(f"Mean: {np.mean(x_test_patches):.4f}")
+            print(f"Std: {np.std(x_test_patches):.4f}")
+            print(f"Min: {np.min(x_test_patches):.4f}")
+            print(f"Max: {np.max(x_test_patches):.4f}")
 
-        # 5) Save test patches
-        test_path = os.path.join(save_dir, "msl_test.npz")
-        np.savez_compressed(test_path,
-                          x_patches=x_test_patches,
-                          y_patches=y_test_patches)
+        return x_test_patches, y_test_patches
 
-        if self.debug:
-            print(f"\nSaved test patches to: {test_path}")
-
-        return test_path
-
-    def split_test_into_tune_and_final(self, test_path: str, save_dir: str = "data/MSL/patches"):
+    def split_test_into_tune_and_final(self, x_test_patches: np.ndarray, y_test_patches: np.ndarray, save_dir: str = "data/MSL/patches"):
         """
         将测试集划分为微调集和最终测试集
         
         Args:
-            test_path: Path to the original test patches file (msl_test.npz)
+            x_test_patches: Test input patches array
+            y_test_patches: Test output patches array
             save_dir: Directory to save the split results
             
         Returns:
@@ -239,23 +261,18 @@ class AnomalyPatchExtractor:
         """
         os.makedirs(save_dir, exist_ok=True)
         
-        # 1) Load original test patches
-        data = np.load(test_path)
-        x_all = data["x_patches"]
-        y_all = data["y_patches"]
+        # 1) Calculate split sizes
+        final_test_size = int(len(x_test_patches) * FINAL_TEST_RATIO)  # 20% for final test
+        tune_size = len(x_test_patches) - final_test_size
         
-        # 2) Calculate split sizes
-        final_test_size = int(len(x_all) * FINAL_TEST_RATIO)  # 20% for final test
-        tune_size = len(x_all) - final_test_size
+        # 2) Split into final test and tuning sets
+        x_final_test = x_test_patches[-final_test_size:]
+        y_final_test = y_test_patches[-final_test_size:]
         
-        # 3) Split into final test and tuning sets
-        x_final_test = x_all[-final_test_size:]
-        y_final_test = y_all[-final_test_size:]
+        x_tune_all = x_test_patches[:-final_test_size]
+        y_tune_all = y_test_patches[:-final_test_size]
         
-        x_tune_all = x_all[:-final_test_size]
-        y_tune_all = y_all[:-final_test_size]
-        
-        # 4) Further split tuning set into train and validation
+        # 3) Further split tuning set into train and validation
         val_size = int(tune_size * TUNE_VAL_RATIO)
         train_size = tune_size - val_size
         
@@ -265,7 +282,7 @@ class AnomalyPatchExtractor:
         x_tune_val = x_tune_all[train_size:]
         y_tune_val = y_tune_all[train_size:]
         
-        # 5) Save all splits
+        # 4) Save all splits
         tune_train_path = os.path.join(save_dir, "msl_tune_train.npz")
         tune_val_path = os.path.join(save_dir, "msl_tune_val.npz")
         final_test_path = os.path.join(save_dir, "msl_final_test.npz")
@@ -311,35 +328,6 @@ class AnomalyPatchExtractor:
         for key in data:
             print(f"{key}: {data[key].shape}")
 
-    @staticmethod
-    def load_scaler(save_dir: str = "data/MSL/patches") -> StandardScaler:
-        """
-        加载保存的 scaler
-        
-        Args:
-            save_dir: 保存 scaler 的目录
-            
-        Returns:
-            StandardScaler: 加载的标准化器
-        """
-        scaler_path = os.path.join(save_dir, "scaler.pkl")
-        return joblib.load(scaler_path)
-
-    @staticmethod
-    def inverse_transform(data: np.ndarray, save_dir: str = "data/MSL/patches") -> np.ndarray:
-        """
-        将标准化后的数据转换回原始尺度
-        
-        Args:
-            data: 标准化后的数据
-            save_dir: 保存 scaler 的目录
-            
-        Returns:
-            np.ndarray: 原始尺度的数据
-        """
-        scaler = AnomalyPatchExtractor.load_scaler(save_dir)
-        return scaler.inverse_transform(data)
-
 
 if __name__ == "__main__":
     # Create save directory path
@@ -356,13 +344,15 @@ if __name__ == "__main__":
     
     # 2) Process test set
     print("\n=== Processing Test Set ===")
-    test_path = extractor.extract_test_set(save_dir=save_dir)
-    AnomalyPatchExtractor.verify_saved_patch_split(test_path)
+    x_test_patches, y_test_patches = extractor.extract_test_set(save_dir=save_dir)
+    if extractor.debug:
+        print("\n=== Test patch shapes ===")
+        print(f"Test x patches: {x_test_patches.shape}, Test y patches: {y_test_patches.shape}")
     
     # 3) Split test set into tuning and final test sets
     print("\n=== Splitting Test Set into Tuning and Final Test Sets ===")
     tune_train_path, tune_val_path, final_test_path = extractor.split_test_into_tune_and_final(
-        test_path, save_dir=save_dir
+        x_test_patches, y_test_patches, save_dir=save_dir
     )
     AnomalyPatchExtractor.verify_saved_patch_split(tune_train_path)
     AnomalyPatchExtractor.verify_saved_patch_split(tune_val_path)
