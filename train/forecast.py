@@ -353,11 +353,11 @@ def forecast_with_head():
 
     avg_test_mse = running_test_mse / test_batches
     avg_test_mae = running_test_mae / test_batches
-    total_test_loss = running_test_total / test_batches
+
     print(f"\n[Test Results]")
     print(f"  MSE: {avg_test_mse:.6f}")
     print(f"  MAE: {avg_test_mae:.6f}")
-    print(f"  Total Loss: {total_test_loss:.6f}")
+
 
 
 if __name__ == "__main__":
