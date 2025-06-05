@@ -2,6 +2,7 @@ import os
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
+import joblib
 from preprocess.datatool import DataTool
 
 # ====== Global Constants ======
@@ -33,6 +34,7 @@ class AnomalyPatchExtractor:
         valid_ratio: float        = VALID_RATIO,
         patch_len: int            = PATCH_LEN,
         patch_stride: int         = PATCH_STRIDE,
+        normalize: bool           = True,  # 新增：是否进行标准化
         debug: bool               = False
     ):
         self.data_tool    = DataTool(filename, debug=debug)
@@ -43,6 +45,8 @@ class AnomalyPatchExtractor:
         self.valid_ratio  = valid_ratio
         self.patch_len    = patch_len
         self.patch_stride = patch_stride
+        self.normalize    = normalize  # 新增：标准化开关
+        self.scaler       = StandardScaler() if normalize else None  # 新增：标准化器
         self.debug        = debug
 
     def _extract_sliding_windows(self, data: np.ndarray) -> tuple:
@@ -110,14 +114,32 @@ class AnomalyPatchExtractor:
         """
         os.makedirs(save_dir, exist_ok=True)
 
-        # 1) Load & standardize whole dataset
-        data = self.data_tool.get_data()  # shape = (T, C)
+        # 1) Load raw dataset (不使用 DataTool 的标准化)
+        data_raw = self.data_tool.load()  # shape = (T, C)
 
-        # 2) Extract all sliding windows (x_windows, y_windows)
+        # 2) 标准化处理
+        if self.normalize:
+            # 只使用训练部分拟合 scaler
+            T = data_raw.shape[0]
+            train_T = int(T * self.train_ratio)
+            self.scaler.fit(data_raw[:train_T])
+            
+            # 对所有数据应用相同的 transform
+            data = self.scaler.transform(data_raw)
+            
+            # 保存 scaler
+            scaler_path = os.path.join(save_dir, "scaler.pkl")
+            joblib.dump(self.scaler, scaler_path)
+            if self.debug:
+                print(f"\nSaved scaler to: {scaler_path}")
+        else:
+            data = data_raw
+
+        # 3) Extract all sliding windows (x_windows, y_windows)
         x_all, y_all = self._extract_sliding_windows(data)
         N, _, C = x_all.shape
 
-        # 3) Convert each window into patches
+        # 4) Convert each window into patches
         x_patches_all = self._split_windows_into_patches(x_all)
         y_patches_all = self._split_windows_into_patches(y_all)
 
@@ -126,10 +148,10 @@ class AnomalyPatchExtractor:
             print(f"x_patches_all shape: {x_patches_all.shape}")
             print(f"y_patches_all shape: {y_patches_all.shape}")
 
-        # 4) Determine train/valid indices over windows
+        # 5) Determine train/valid indices over windows
         (t0, t1), (v0, v1) = self._split_indices(N)
 
-        # 5) Slice patches by index
+        # 6) Slice patches by index
         x_train_patches = x_patches_all[t0:t1]
         y_train_patches = y_patches_all[t0:t1]
 
@@ -141,7 +163,7 @@ class AnomalyPatchExtractor:
             print(f"Train x patches: {x_train_patches.shape}, Train y patches: {y_train_patches.shape}")
             print(f"Valid x patches: {x_valid_patches.shape}, Valid y patches: {y_valid_patches.shape}")
 
-        # 6) Save each split into .npz
+        # 7) Save each split into .npz
         train_path = os.path.join(save_dir, "msl_train.npz")
         valid_path = os.path.join(save_dir, "msl_val.npz")
 
@@ -171,14 +193,21 @@ class AnomalyPatchExtractor:
         """
         os.makedirs(save_dir, exist_ok=True)
 
-        # 1) Load & standardize test dataset
+        # 1) Load test dataset (不使用 DataTool 的标准化)
         test_data_tool = DataTool(test_filename, debug=self.debug)
-        test_data = test_data_tool.get_data()  # shape = (T, C)
+        test_data_raw = test_data_tool.load()  # shape = (T, C)
 
-        # 2) Extract sliding windows
+        # 2) 标准化处理
+        if self.normalize:
+            # 使用训练好的 scaler 转换测试数据
+            test_data = self.scaler.transform(test_data_raw)
+        else:
+            test_data = test_data_raw
+
+        # 3) Extract sliding windows
         x_test, y_test = self._extract_sliding_windows(test_data)
 
-        # 3) Convert windows into patches
+        # 4) Convert windows into patches
         x_test_patches = self._split_windows_into_patches(x_test)
         y_test_patches = self._split_windows_into_patches(y_test)
 
@@ -186,7 +215,7 @@ class AnomalyPatchExtractor:
             print("\n=== Test patch shapes ===")
             print(f"Test x patches: {x_test_patches.shape}, Test y patches: {y_test_patches.shape}")
 
-        # 4) Save test patches
+        # 5) Save test patches
         test_path = os.path.join(save_dir, "msl_test.npz")
         np.savez_compressed(test_path,
                           x_patches=x_test_patches,
@@ -281,6 +310,35 @@ class AnomalyPatchExtractor:
         print(f"*** Contents of {split_path} ***")
         for key in data:
             print(f"{key}: {data[key].shape}")
+
+    @staticmethod
+    def load_scaler(save_dir: str = "data/MSL/patches") -> StandardScaler:
+        """
+        加载保存的 scaler
+        
+        Args:
+            save_dir: 保存 scaler 的目录
+            
+        Returns:
+            StandardScaler: 加载的标准化器
+        """
+        scaler_path = os.path.join(save_dir, "scaler.pkl")
+        return joblib.load(scaler_path)
+
+    @staticmethod
+    def inverse_transform(data: np.ndarray, save_dir: str = "data/MSL/patches") -> np.ndarray:
+        """
+        将标准化后的数据转换回原始尺度
+        
+        Args:
+            data: 标准化后的数据
+            save_dir: 保存 scaler 的目录
+            
+        Returns:
+            np.ndarray: 原始尺度的数据
+        """
+        scaler = AnomalyPatchExtractor.load_scaler(save_dir)
+        return scaler.inverse_transform(data)
 
 
 if __name__ == "__main__":

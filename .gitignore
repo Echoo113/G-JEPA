@@ -39,6 +39,8 @@ model/
 *.pt
 *.pth
 *.h5
+# Allow MSL patches
+!data/MSL/patches/*.npz
 *.npz
 
 # Logs and plots
