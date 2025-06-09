@@ -53,4 +53,7 @@ Thumbs.db
 
 # Large files
 uea_dim256_codebook512.zip
-checkpoints/uea_dim256_codebook512/VQShape.ckpt 
+checkpoints/uea_dim256_codebook512/VQShape.ckpt
+
+# Large model files
+model/jepa_best.pt 
