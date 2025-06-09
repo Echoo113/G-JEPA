@@ -1,10 +1,3 @@
-# Data files
-data/**/*.npz
-data/**/*.npy
-data/**/*.csv
-data/**/*.pkl
-data/**/*.tsf
-
 # Python
 __pycache__/
 *.py[cod]
@@ -41,15 +34,6 @@ ENV/
 # Jupyter Notebook
 .ipynb_checkpoints
 *.ipynb
-
-# Model files and data
-model/
-*.pt
-*.pth
-*.h5
-# Allow MSL patches
-!data/MSL/patches/*.npz
-*.npz
 
 # Logs and plots
 *.log
