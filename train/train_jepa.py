@@ -25,7 +25,7 @@ LATENT_DIM               = 512
 EPOCHS                   = 100
 LEARNING_RATE            = 1e-4
 WEIGHT_DECAY             = 1e-6
-EARLY_STOPPING_PATIENCE  = 20
+EARLY_STOPPING_PATIENCE  = 10
 EARLY_STOPPING_DELTA     = 1e-6
 TRAIN_WEIGHT             = 0.4
 VAL_WEIGHT               = 0.6
@@ -291,7 +291,8 @@ for epoch in range(1, EPOCHS + 1):
     history['val_contrastive'].append(avg_val_contrastive)
 
     # ------ Early Stopping 判断 ------
-    combined_score = TRAIN_WEIGHT * avg_train_mse + VAL_WEIGHT * avg_val_mse
+    combined_score = (TRAIN_WEIGHT * avg_train_mse + VAL_WEIGHT * avg_val_mse) + \
+                    (TRAIN_WEIGHT * avg_train_contrastive + VAL_WEIGHT * avg_val_contrastive)
     
     if combined_score < best_val_mse - EARLY_STOPPING_DELTA:
         best_val_mse = combined_score
@@ -303,6 +304,8 @@ for epoch in range(1, EPOCHS + 1):
             'epoch': epoch,
             'train_mse': avg_train_mse,
             'val_mse': avg_val_mse,
+            'train_contrastive': avg_train_contrastive,
+            'val_contrastive': avg_val_contrastive,
             'combined_score': combined_score
         }
     else:
@@ -318,7 +321,6 @@ for epoch in range(1, EPOCHS + 1):
     print(f"[Epoch {epoch:02d}] "
           f"Train MSE: {avg_train_mse:.6f}, MAE: {avg_train_mae:.6f}, Contrastive: {avg_train_contrastive:.6f} | "
           f"Val MSE: {avg_val_mse:.6f}, MAE: {avg_val_mae:.6f}, Contrastive: {avg_val_contrastive:.6f} | "
-          f"Combined: {combined_score:.6f} | "
           f"EMA m: {get_ema_momentum(epoch):.3f}")
 
     # First-epoch shape调试信息
@@ -342,11 +344,15 @@ if best_state is not None:
         'num_vars':                   NUM_VARS,
         'train_mse':                  best_state['train_mse'],
         'val_mse':                    best_state['val_mse'],
+        'train_contrastive':          best_state['train_contrastive'],
+        'val_contrastive':            best_state['val_contrastive'],
         'combined_score':             best_state['combined_score']
     }, "model/jepa_best.pt")
     print(f"Best model saved (epoch {best_state['epoch']})")
     print(f"  Train MSE: {best_state['train_mse']:.6f}")
     print(f"  Val MSE: {best_state['val_mse']:.6f}")
+    print(f"  Train Contrastive: {best_state['train_contrastive']:.6f}")
+    print(f"  Val Contrastive: {best_state['val_contrastive']:.6f}")
     print(f"  Combined Score: {best_state['combined_score']:.6f}")
 
 # ========= Step 5: 测试评估 =========
