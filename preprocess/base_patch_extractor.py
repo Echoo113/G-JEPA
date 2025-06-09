@@ -7,7 +7,7 @@ from preprocess.datatool import DataTool
 # ====== Global Constants ======
 DEFAULT_FILENAME   = "data/SOLAR/solar_10_minutes_dataset.csv"
 WINDOW_LEN         = 96    # 每个窗口的长度
-WINDOW_STRIDE      = 96    # 窗口步长，设置为与窗口长度相同，确保不重叠
+WINDOW_STRIDE      = 48    # 窗口步长，设置为与窗口长度相同，确保不重叠
 TRAIN_RATIO        = 0.8   # 训练集比例
 VALID_RATIO        = 0.1   # 验证集比例
 
@@ -68,13 +68,7 @@ class PatchExtractor:
         """
         window_len, C = window.shape
         num_patches = window_len // self.patch_len
-        
-        if self.debug:
-            print(f"\n=== Window Patch Analysis ===")
-            print(f"Window start index: {window_start_idx}")
-            print(f"Window length: {window_len}")
-            print(f"Number of patches per window: {num_patches}")
-            print(f"Each patch length: {self.patch_len}")
+       
         
         # 初始化 patches 数组
         patches = np.zeros((num_patches, self.patch_len, C), dtype=window.dtype)
@@ -91,15 +85,6 @@ class PatchExtractor:
         x_patches = patches[:-1]  # 除了最后一个 patch
         y_patches = patches[1:]   # 除了第一个 patch
         
-        if self.debug:
-            print("\n=== Patch Pairs ===")
-            for i in range(len(x_patches)):
-                x_start = window_start_idx + i * self.patch_len
-                x_end = x_start + self.patch_len
-                y_start = window_start_idx + (i + 1) * self.patch_len
-                y_end = y_start + self.patch_len
-                print(f"Pair {i}:")
-                print(f"  X: [{x_start}:{x_end}] → Y: [{y_start}:{y_end}]")
         
         return x_patches, y_patches
 
@@ -134,11 +119,7 @@ class PatchExtractor:
         windows = self._extract_sliding_windows(data)
         N = len(windows)
         
-        if self.debug:
-            print(f"\n=== Window Info ===")
-            print(f"Total number of windows: {N}")
-            print(f"Window length: {self.window_len}")
-            print(f"Window stride: {self.window_stride}")
+        
 
         # 3) 将每个窗口分割成 patches
         x_patches_list = []
