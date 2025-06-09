@@ -21,7 +21,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 训练超参数
 BATCH_SIZE               = 64
-LATENT_DIM               = 1024
+LATENT_DIM               = 512
 EPOCHS                   = 100
 LEARNING_RATE            = 5e-4
 WEIGHT_DECAY             = 1e-6
@@ -32,7 +32,7 @@ VAL_WEIGHT               = 0.6
 
 # 损失函数权重
 RECONSTRUCTION_WEIGHT   = 1.0  # α: 重建损失权重
-CONTRASTIVE_WEIGHT      = 1.0  # β: 对比损失权重
+CONTRASTIVE_WEIGHT      = 10.0  # β: 对比损失权重
 TEMPERATURE             = 0.07  # 对比损失的温度系数
 
 # EMA 相关参数
