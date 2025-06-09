@@ -7,7 +7,7 @@ from preprocess.datatool import DataTool
 # ====== Global Constants ======
 DEFAULT_FILENAME   = "data/SOLAR/solar_10_minutes_dataset.csv"
 WINDOW_LEN         = 96    # 每个窗口的长度
-WINDOW_STRIDE      = 48    # 窗口步长，设置为与窗口长度相同，确保不重叠
+WINDOW_STRIDE      = 24    # 窗口步长
 TRAIN_RATIO        = 0.8   # 训练集比例
 VALID_RATIO        = 0.1   # 验证集比例
 
@@ -78,9 +78,7 @@ class PatchExtractor:
             start = i * self.patch_len
             end = start + self.patch_len
             patches[i] = window[start:end]
-            if self.debug:
-                print(f"Patch {i}: [{window_start_idx + start}:{window_start_idx + end}]")
-        
+            
         # 构造输入和输出
         x_patches = patches[:-1]  # 除了最后一个 patch
         y_patches = patches[1:]   # 除了第一个 patch

@@ -17,15 +17,15 @@ from jepa.predictor import JEPPredictor
 # ========= 全局设置 =========
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-BATCH_SIZE               = 32
-LATENT_DIM               = 1024  # 更新为1024以匹配JEPA
+BATCH_SIZE               = 16    # 减小 batch size 以提高精度
+LATENT_DIM               = 1024  # 保持 1024 以匹配 JEPA
 PATCH_LENGTH             = 16
 NUM_VARS                 = 137
 PREDICTION_LENGTH        = 5     # 更新为5以匹配数据集
 
 # 用于训练 ForecastHead 的超参数
-HEAD_EPOCHS              = 50
-HEAD_LR                  = 1e-5
+HEAD_EPOCHS              = 100   # 增加训练轮数
+HEAD_LR                  = 5e-6  # 降低学习率以提高稳定性
 WEIGHT_DECAY_HEAD        = 1e-6
 EARLY_STOPPING_PATIENCE  = 15
 EARLY_STOPPING_DELTA     = 1e-6
@@ -37,16 +37,18 @@ PATCH_FILE_TEST          = "data/SOLAR/patches/solar_test.npz"
 JEPA_CHECKPOINT_PATH     = "model/jepa_best.pt"
 FORECAST_HEAD_PATH       = "model/forecast_head_best.pt"
 
-# ========= ForecastHead 定义（改进版：预测变量均值） =========
+# ========= ForecastHead 定义（改进版：重建完整 patch） =========
 class ForecastHead(nn.Module):
     """
-    将 latent 向量映射到变量均值空间。
+    将 latent 向量映射回原始 patch 空间。
     输入 shape = (batch_size, num_patches, LATENT_DIM)
-    输出 shape = (batch_size, num_patches, NUM_VARS)
+    输出 shape = (batch_size, num_patches, PATCH_LENGTH, NUM_VARS)
     """
-    def __init__(self, latent_dim: int, num_vars: int):
+    def __init__(self, latent_dim: int, patch_length: int, num_vars: int):
         super().__init__()
+        self.patch_length = patch_length
         self.num_vars = num_vars
+        self.output_dim = patch_length * num_vars
 
         # 改进的网络结构：添加 LayerNorm 和 Skip Connection
         self.norm1 = nn.LayerNorm(latent_dim)
@@ -54,13 +56,13 @@ class ForecastHead(nn.Module):
         self.norm2 = nn.LayerNorm(latent_dim * 2)
         self.fc2 = nn.Linear(latent_dim * 2, latent_dim)
         self.norm3 = nn.LayerNorm(latent_dim)
-        self.fc3 = nn.Linear(latent_dim, num_vars)  # 直接输出变量均值
+        self.fc3 = nn.Linear(latent_dim, self.output_dim)  # 输出完整 patch
         self.act = nn.GELU()
 
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
         """
         latent: (B, N, LATENT_DIM)
-        返回: (B, N, NUM_VARS)
+        返回: (B, N, PATCH_LENGTH, NUM_VARS)
         """
         b, n, ld = latent.shape
         x = latent.view(b * n, ld)  # (B*N, LATENT_DIM)
@@ -77,13 +79,14 @@ class ForecastHead(nn.Module):
         x = x + identity  # Skip connection
         x = self.fc3(x)
         
-        return x.view(b, n, self.num_vars)
+        # 重塑为完整 patch 形状
+        return x.view(b, n, self.patch_length, self.num_vars)
 
 # ========= 工具函数 =========
 def compute_loss(pred: torch.Tensor, target: torch.Tensor) -> dict:
     """
-    计算变量均值空间上的 MSE 和 MAE。
-    pred, target 形状均为 (B, N, NUM_VARS)
+    计算完整 patch 空间上的 MSE 和 MAE。
+    pred, target 形状均为 (B, N, PATCH_LENGTH, NUM_VARS)
     返回: {'mse': mse, 'mae': mae}
     """
     mse = nn.MSELoss(reduction="mean")(pred, target)
@@ -92,8 +95,8 @@ def compute_loss(pred: torch.Tensor, target: torch.Tensor) -> dict:
 
 def compute_metrics_real(pred: torch.Tensor, target: torch.Tensor) -> dict:
     """
-    计算变量均值空间上的 MSE 和 MAE 误差。
-    pred, target 形状均为 (B, N, NUM_VARS)
+    计算完整 patch 空间上的 MSE 和 MAE 误差。
+    pred, target 形状均为 (B, N, PATCH_LENGTH, NUM_VARS)
     """
     mse = nn.MSELoss(reduction="mean")(pred, target)
     mae = nn.L1Loss(reduction="mean")(pred, target)
@@ -158,7 +161,7 @@ def load_pretrained_jepa(checkpoint_path: str):
 
 def train_and_save_forecast_head():
     """
-    训练 ForecastHead，使用 predictor 生成的 latent 来预测变量均值。
+    训练 ForecastHead，使用 predictor 生成的 latent 来重建完整 patch。
     """
     # Step 1: 准备 DataLoader
     print("[Step 1] Preparing DataLoaders for head training...")
@@ -175,6 +178,7 @@ def train_and_save_forecast_head():
     print("\n[Step 3] Initializing ForecastHead...")
     head = ForecastHead(
         latent_dim=LATENT_DIM,
+        patch_length=PATCH_LENGTH,
         num_vars=NUM_VARS
     ).to(DEVICE)
 
@@ -211,12 +215,11 @@ def train_and_save_forecast_head():
                 tgt_latent = encoder_ema(y_batch)
                 pred_latent, _ = predictor(ctx_latent, tgt_latent)
 
-            # 2. 使用 ForecastHead 预测变量均值
-            pred_mean = head(pred_latent)  # (B, N, NUM_VARS)
-            target_mean = y_batch.mean(dim=2)  # (B, N, NUM_VARS)
+            # 2. 使用 ForecastHead 重建完整 patch
+            pred_patch = head(pred_latent)  # (B, N, PATCH_LENGTH, NUM_VARS)
 
             # 3. 计算损失并更新
-            metrics = compute_loss(pred_mean, target_mean)
+            metrics = compute_loss(pred_patch, y_batch)
             loss = metrics['mse']
             optimizer.zero_grad()
             loss.backward()
@@ -245,11 +248,10 @@ def train_and_save_forecast_head():
                 tgt_latent = encoder_ema(y_batch)
                 pred_latent, _ = predictor(ctx_latent, tgt_latent)
 
-                # 2. 使用 ForecastHead 预测变量均值
-                pred_mean = head(pred_latent)
-                target_mean = y_batch.mean(dim=2)
+                # 2. 使用 ForecastHead 重建完整 patch
+                pred_patch = head(pred_latent)
 
-                metrics = compute_loss(pred_mean, target_mean)
+                metrics = compute_loss(pred_patch, y_batch)
                 running_val_mse += metrics['mse'].item()
                 running_val_mae += metrics['mae'].item()
                 val_batches += 1
@@ -290,6 +292,7 @@ def train_and_save_forecast_head():
         os.makedirs(os.path.dirname(FORECAST_HEAD_PATH), exist_ok=True)
         torch.save({
             'forecasthead_state_dict': best_state['head_state_dict'],
+            'patch_length': PATCH_LENGTH,
             'num_vars': NUM_VARS,
             'latent_dim': LATENT_DIM,
             'epoch': best_state['epoch'],
@@ -320,6 +323,7 @@ def forecast_with_head():
     ckpt = torch.load(FORECAST_HEAD_PATH, map_location=DEVICE)
     forecast_head = ForecastHead(
         latent_dim = ckpt['latent_dim'],
+        patch_length = ckpt['patch_length'],
         num_vars = ckpt['num_vars']
     ).to(DEVICE)
     forecast_head.load_state_dict(ckpt['forecasthead_state_dict'])
@@ -341,12 +345,11 @@ def forecast_with_head():
             tgt_latent = encoder_ema(y_batch)
             pred_latent, _ = predictor(ctx_latent, tgt_latent)
 
-            # 2. 使用 ForecastHead 预测变量均值
-            pred_mean = forecast_head(pred_latent)
-            target_mean = y_batch.mean(dim=2)
+            # 2. 使用 ForecastHead 重建完整 patch
+            pred_patch = forecast_head(pred_latent)
 
             # 3. 计算误差
-            metrics = compute_metrics_real(pred_mean, target_mean)
+            metrics = compute_metrics_real(pred_patch, y_batch)
             running_test_mse += metrics['mse']
             running_test_mae += metrics['mae']
             test_batches += 1
