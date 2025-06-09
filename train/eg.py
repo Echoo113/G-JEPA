@@ -4,6 +4,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
+from torch.utils.data import DataLoader, TensorDataset
 
 # --- 将项目根目录添加到Python路径，确保可以导入自定义模块 ---
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -11,21 +12,20 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 # --- 从你的项目中导入必要的模块 ---
+# 假设这些模块可以被正确找到
 from jepa.encoder import MyTimeSeriesEncoder
-from patch_loader import AnomalyPatchExtractor # 假设你的数据加载器类叫这个名字
 
-# ========= 配置参数 (必须与你的训练脚本保持一致!) =========
-MODEL_PATH = "model/jepa_hybrid_best.pt"
+# ========= 配置参数 =========
+# --- 路径配置 ---
+PRETRAINED_MODEL_PATH = "model/jepa_best.pt"
 TUNE_TRAIN_DATA_PATH = "data/MSL/patches/msl_tune_train.npz"
 TUNE_TRAIN_LABELS_PATH = "data/MSL/patches/msl_tune_train_labels.npz"
 
-# --- 模型和数据维度配置 ---
-# 注意：这些参数必须和你训练时使用的完全一样！
-# 根据你之前提供的数据维度，这里已经帮你填好了
-PATCH_LENGTH = 20
-NUM_VARS = 55
-LATENT_DIM = 512 # 建议使用512，如果你训练时用了1024，请改回1024
-PREDICTION_LENGTH = 9
+# --- 可视化配置 ---
+# 为了速度，我们可以只对一部分数据进行可视化。设置为 None 则使用全部数据。
+SAMPLE_SIZE = 4000 
+TSNE_PERPLEXITY = 40  # t-SNE的一个关键参数，通常在5-50之间
+BATCH_SIZE = 256 # 用于特征提取的批次大小
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -34,108 +34,134 @@ def main():
     主执行函数
     """
     # ========= Step 1: 加载训练好的模型和Encoder权重 =========
-    print(f"[Step 1] 正在从 {MODEL_PATH} 加载模型...")
+    print(f"[Step 1] 正在从 {PRETRAINED_MODEL_PATH} 加载预训练模型...")
 
-    if not os.path.exists(MODEL_PATH):
-        print(f"错误：找不到模型文件 {MODEL_PATH}。请先运行训练脚本。")
+    if not os.path.exists(PRETRAINED_MODEL_PATH):
+        print(f"错误：找不到模型文件 '{PRETRAINED_MODEL_PATH}'。请先运行JEPA预训练脚本。")
         return
 
-    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
+    # 加载checkpoint
+    checkpoint = torch.load(PRETRAINED_MODEL_PATH, map_location=DEVICE)
+    
+    # 优先从checkpoint中恢复模型配置
+    try:
+        config = checkpoint['config']
+        print("成功从checkpoint加载模型配置。")
+    except KeyError:
+        print("警告: checkpoint中未找到'config'字典。将使用脚本中的默认值。")
+        # 如果checkpoint中没有存配置，你需要在这里手动填写
+        config = {
+            'latent_dim': 512, 
+            'patch_length': 20,
+            'num_vars': 55
+        }
 
     # 重新实例化一个与训练时结构相同的Encoder
-    encoder_online = MyTimeSeriesEncoder(
-        patch_length=PATCH_LENGTH,
-        num_vars=NUM_VARS,
-        latent_dim=checkpoint.get('latent_dim', LATENT_DIM), # 优先从文件中读取维度
-        time_layers=2,
-        patch_layers=3,
-        num_attention_heads=16,
-        ffn_dim=checkpoint.get('latent_dim', LATENT_DIM) * 4,
-        dropout=0.2
+    encoder = MyTimeSeriesEncoder(
+        patch_length=config['patch_length'],
+        num_vars=config['num_vars'],
+        latent_dim=config['latent_dim'],
+        time_layers=2, patch_layers=3, num_attention_heads=16,
+        ffn_dim=config['latent_dim'] * 4, dropout=0.2
     ).to(DEVICE)
 
-    # 加载 online_encoder 的权重
-    encoder_online.load_state_dict(checkpoint['encoder_online'])
-    encoder_online.eval()  # 设置为评估模式
-    print("Online Encoder 加载成功并已设置为评估模式。")
+    # 加载 Target (EMA) Encoder 的权重，这对于下游任务是最佳实践
+    encoder.load_state_dict(checkpoint['encoder_target_state_dict'])
+    encoder.eval()  # 设置为评估模式
+    print("Target (EMA) Encoder 加载成功并已设置为评估模式。")
 
-    # ========= Step 2: 加载微调数据集和标签 =========
-    print("\n[Step 2] 正在加载微调数据集和标签...")
+    # ========= Step 2: 加载并重塑数据和标签 =========
+    print("\n[Step 2] 正在加载并重塑微调数据集和标签...")
 
     try:
-        x_patches_data, _ = AnomalyPatchExtractor.load_patch_split(TUNE_TRAIN_DATA_PATH)
-        x_labels_data, _ = AnomalyPatchExtractor.load_patch_split(TUNE_TRAIN_LABELS_PATH)
+        features_data = np.load(TUNE_TRAIN_DATA_PATH)['x_patches']
+        labels_data = np.load(TUNE_TRAIN_LABELS_PATH)['x_labels']
     except FileNotFoundError as e:
         print(f"错误: 找不到数据文件 {e.filename}。请确保数据已生成。")
         return
         
-    print(f"  - 微调数据 (x_patches) 维度: {x_patches_data.shape}")
-    print(f"  - 微调标签 (x_labels) 维度: {x_labels_data.shape}")
+    print(f"  - 原始数据维度: {features_data.shape}")
+    print(f"  - 原始标签维度: {labels_data.shape}")
 
-    # ========= Step 3: 准备数据并提取特征 =========
-    print("\n[Step 3] 正在准备数据并使用Encoder提取特征...")
-
-    # 将数据从 (N, num_patches, patch_len, C) 展平为 (N * num_patches, patch_len, C)
-    # 这样每个补丁都成为一个独立的样本
-    num_samples, num_patches, _, _ = x_patches_data.shape
-    x_patches_flat = x_patches_data.reshape(-1, PATCH_LENGTH, NUM_VARS)
-    x_labels_flat = x_labels_data.reshape(-1)
-
-    print(f"  - 已将数据展平，总补丁数: {x_patches_flat.shape[0]}")
-
-    # 为了快速可视化，我们可以随机抽样一部分数据，例如2000个点
-    # 如果数据量不大或者你想分析全部数据，可以注释掉这部分
-    num_vis_samples = min(2000, x_patches_flat.shape[0])
-    print(f"  - 将随机抽样 {num_vis_samples} 个点进行t-SNE可视化...")
-    indices = np.random.choice(x_patches_flat.shape[0], num_vis_samples, replace=False)
+    # 将序列和补丁维度展平，为特征提取做准备
+    # 特征: (N, Seq, PatchLen, Vars) -> (N*Seq, PatchLen, Vars)
+    # 标签: (N, Seq) -> (N*Seq,)
+    num_sequences, seq_len, patch_len, num_vars = features_data.shape
+    features_flat = features_data.reshape(-1, patch_len, num_vars)
+    labels_flat = labels_data.flatten()
     
-    x_sample = torch.tensor(x_patches_flat[indices], dtype=torch.float32).to(DEVICE)
-    labels_sample = x_labels_flat[indices]
+    print(f"  - 重塑后数据维度 (所有补丁): {features_flat.shape}")
+    print(f"  - 重塑后标签维度 (所有补丁): {labels_flat.shape}")
 
-    # 使用Encoder提取特征
+    # ========= Step 3: 使用Encoder批量提取特征 =========
+    print("\n[Step 3] 正在批量提取特征向量...")
+
+    dataset = TensorDataset(torch.from_numpy(features_flat).float())
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    all_embeddings = []
     with torch.no_grad():
-        latent_vectors = encoder_online(x_sample).cpu().numpy()
+        for batch in loader:
+            x_batch = batch[0].to(DEVICE)
+            
+            # Encoder期望输入有序列维度，所以为每个补丁增加一个虚拟的序列维度
+            # (B, P, V) -> (B, 1, P, V)
+            z = encoder(x_batch.unsqueeze(1))
+            # 移除虚拟的序列维度，得到特征向量
+            # (B, 1, D) -> (B, D)
+            z = z.squeeze(1)
+            
+            all_embeddings.append(z.cpu().numpy())
 
-    print(f"  - 特征提取完成，特征向量维度: {latent_vectors.shape}")
+    all_embeddings = np.concatenate(all_embeddings, axis=0)
+    print(f"成功提取了 {all_embeddings.shape[0]} 个补丁的特征向量。")
+    print(f"  - 特征向量维度: {all_embeddings.shape}")
 
-    # ========= Step 4: 使用t-SNE进行降维和可视化 =========
-    print("\n[Step 4] 正在使用t-SNE进行降维...")
-    tsne = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42, verbose=1)
-    tsne_results = tsne.fit_transform(latent_vectors)
-    print("t-SNE降维完成。")
+    # ========= Step 4: 使用t-SNE降维并可视化 =========
+    print(f"\n[Step 4] 正在使用t-SNE降维并进行可视化...")
 
-    print("正在绘制特征空间散点图...")
-    plt.figure(figsize=(12, 10))
+    # 如果指定了样本大小，则进行随机采样
+    num_total_points = all_embeddings.shape[0]
+    if SAMPLE_SIZE is not None and SAMPLE_SIZE < num_total_points:
+        print(f"  - 将随机抽样 {SAMPLE_SIZE} / {num_total_points} 个点进行可视化...")
+        indices = np.random.choice(num_total_points, SAMPLE_SIZE, replace=False)
+        embeddings_to_plot = all_embeddings[indices]
+        labels_to_plot = labels_flat[indices]
+    else:
+        embeddings_to_plot = all_embeddings
+        labels_to_plot = labels_flat
+
+    print("  - 正在运行 t-SNE... (这可能需要一些时间)")
+    tsne = TSNE(n_components=2, perplexity=TSNE_PERPLEXITY, random_state=42, n_iter=1000, verbose=1)
+    embeddings_2d = tsne.fit_transform(embeddings_to_plot)
+    print("  - t-SNE降维完成。")
+
+    # 分离正常和异常点用于绘图
+    normal_points = embeddings_2d[labels_to_plot == 0]
+    anomaly_points = embeddings_2d[labels_to_plot == 1]
     
-    # 分离正常点和异常点
-    normal_indices = np.where(labels_sample == 0)
-    anomaly_indices = np.where(labels_sample == 1)
+    print(f"  - 绘图点数: {len(embeddings_2d)} (正常: {len(normal_points)}, 异常: {len(anomaly_points)})")
 
+    # 开始绘图
+    plt.style.use('seaborn-v0_8-whitegrid')
+    plt.figure(figsize=(14, 12))
+    
     # 绘制正常点 (蓝色)
     plt.scatter(
-        tsne_results[normal_indices, 0], 
-        tsne_results[normal_indices, 1], 
-        label='正常 (Normal)', 
-        alpha=0.6, 
-        c='steelblue',
-        s=15 # 点的大小
+        normal_points[:, 0], normal_points[:, 1], 
+        s=15, c='royalblue', alpha=0.6, label=f'Normal ({len(normal_points)})'
     )
     # 绘制异常点 (红色)
     plt.scatter(
-        tsne_results[anomaly_indices, 0], 
-        tsne_results[anomaly_indices, 1], 
-        label='异常 (Anomaly)', 
-        alpha=0.9, 
-        c='red',
-        s=25 # 让异常点更突出
+        anomaly_points[:, 0], anomaly_points[:, 1], 
+        s=40, c='red', marker='x', label=f'Anomaly ({len(anomaly_points)})'
     )
 
-    plt.title('Encoder输出特征的t-SNE二维可视化', fontsize=16)
-    plt.xlabel('t-SNE 维度 1', fontsize=12)
-    plt.ylabel('t-SNE 维度 2', fontsize=12)
-    plt.legend()
-    plt.grid(True)
+    plt.title('t-SNE Visualization of Encoder Feature Space', fontsize=18, fontweight='bold')
+    plt.xlabel('t-SNE Dimension 1', fontsize=14)
+    plt.ylabel('t-SNE Dimension 2', fontsize=14)
+    plt.legend(fontsize=12)
     plt.show()
-
+   
 if __name__ == "__main__":
     main()
