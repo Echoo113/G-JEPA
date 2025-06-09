@@ -20,7 +20,7 @@ from jepa.predictor import JEPPredictor
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 训练超参数
-BATCH_SIZE               = 32
+BATCH_SIZE               = 64
 LATENT_DIM               = 1024
 EPOCHS                   = 100
 LEARNING_RATE            = 5e-4
@@ -41,9 +41,9 @@ EMA_WARMUP_EPOCHS       = 10    # EMA 预热轮数
 EMA_WARMUP_MOMENTUM     = 0.95  # 预热期的 EMA 动量
 
 # 数据集配置
-PATCH_LENGTH             = 16    # 每个patch 16步
-NUM_VARS                 = 137   # 137个变量
-PREDICTION_LENGTH        = 5     # 预测未来5个patch（从数据形状看是5而不是9）
+PATCH_LENGTH             = 20    # 每个patch 20步
+NUM_VARS                 = 55
+PREDICTION_LENGTH        = 9     # 预测未来9个patch
 
 # ========= 工具函数 =========
 def compute_metrics(pred: torch.Tensor, target: torch.Tensor) -> dict:
@@ -118,6 +118,12 @@ print("[Step 1] Preparing DataLoaders...")
 train_loader = create_patch_loader("data/MSL/patches/msl_train.npz", BATCH_SIZE, shuffle=True)
 val_loader   = create_patch_loader("data/MSL/patches/msl_val.npz",   BATCH_SIZE, shuffle=False)
 test_loader  = create_patch_loader("data/MSL/patches/msl_final_test.npz",  BATCH_SIZE, shuffle=False)
+
+# 打印数据维度信息
+for x_batch, y_batch in train_loader:
+    print(f"Input data shape: {x_batch.shape}")
+    print(f"Target data shape: {y_batch.shape}")
+    break
 
 print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)} | Test batches: {len(test_loader)}")
 
