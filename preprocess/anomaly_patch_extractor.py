@@ -305,6 +305,87 @@ class AnomalyPatchExtractor:
         
         return tune_train_path, tune_val_path, final_test_path
 
+    def extract_and_process_test_labels(self, label_filename: str = "data/MSL/MSL_test_label.npy", save_dir: str = "data/MSL/patches"):
+        """
+        处理测试集标签数据，将标签数据分割成与测试集数据相同的patch结构
+        
+        Args:
+            label_filename: 测试集标签文件路径
+            save_dir: 保存处理后的标签数据的目录
+            
+        Returns:
+            tuple: (tune_train_labels_path, tune_val_labels_path, final_test_labels_path)
+        """
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # 1) 加载标签数据
+        labels = np.load(label_filename)  # shape = (T,)
+        
+        if self.debug:
+            print("\n=== Label Data Statistics ===")
+            print(f"Total labels: {len(labels)}")
+            print(f"Number of anomalies: {np.sum(labels)}")
+            print(f"Anomaly ratio: {np.sum(labels)/len(labels):.4f}")
+        
+        # 2) 提取滑动窗口
+        x_windows, y_windows = self._extract_sliding_windows(labels.reshape(-1, 1))
+        
+        # 3) 将窗口转换为patches
+        x_patches = self._split_windows_into_patches(x_windows)
+        y_patches = self._split_windows_into_patches(y_windows)
+        
+        # 4) 对每个patch进行处理：如果patch中有任何一个True，则整个patch标记为1
+        x_patches_binary = np.any(x_patches, axis=2).astype(np.int32)
+        y_patches_binary = np.any(y_patches, axis=2).astype(np.int32)
+        
+        # 5) 按照与测试集数据相同的比例进行分割
+        final_test_size = int(len(x_patches_binary) * FINAL_TEST_RATIO)
+        tune_size = len(x_patches_binary) - final_test_size
+        
+        # 分割为最终测试集和调优集
+        x_final_test = x_patches_binary[-final_test_size:]
+        y_final_test = y_patches_binary[-final_test_size:]
+        
+        x_tune_all = x_patches_binary[:-final_test_size]
+        y_tune_all = y_patches_binary[:-final_test_size]
+        
+        # 进一步分割调优集为训练集和验证集
+        val_size = int(tune_size * TUNE_VAL_RATIO)
+        train_size = tune_size - val_size
+        
+        x_tune_train = x_tune_all[:train_size]
+        y_tune_train = y_tune_all[:train_size]
+        
+        x_tune_val = x_tune_all[train_size:]
+        y_tune_val = y_tune_all[train_size:]
+        
+        # 6) 保存所有分割
+        tune_train_labels_path = os.path.join(save_dir, "msl_tune_train_labels.npz")
+        tune_val_labels_path = os.path.join(save_dir, "msl_tune_val_labels.npz")
+        final_test_labels_path = os.path.join(save_dir, "msl_final_test_labels.npz")
+        
+        np.savez_compressed(tune_train_labels_path,
+                          x_labels=x_tune_train,
+                          y_labels=y_tune_train)
+        np.savez_compressed(tune_val_labels_path,
+                          x_labels=x_tune_val,
+                          y_labels=y_tune_val)
+        np.savez_compressed(final_test_labels_path,
+                          x_labels=x_final_test,
+                          y_labels=y_final_test)
+        
+        if self.debug:
+            print("\n=== Label Split Results ===")
+            print(f"Tune Train Labels: {x_tune_train.shape[0]} patches")
+            print(f"Tune Valid Labels: {x_tune_val.shape[0]} patches")
+            print(f"Final Test Labels: {x_final_test.shape[0]} patches")
+            print("\n=== Label Statistics ===")
+            print(f"Tune Train Anomaly Ratio: {np.sum(x_tune_train)/x_tune_train.size:.4f}")
+            print(f"Tune Valid Anomaly Ratio: {np.sum(x_tune_val)/x_tune_val.size:.4f}")
+            print(f"Final Test Anomaly Ratio: {np.sum(x_final_test)/x_final_test.size:.4f}")
+        
+        return tune_train_labels_path, tune_val_labels_path, final_test_labels_path
+
     @staticmethod
     def load_patch_split(split_path: str) -> tuple:
         """
@@ -356,4 +437,11 @@ if __name__ == "__main__":
     )
     AnomalyPatchExtractor.verify_saved_patch_split(tune_train_path)
     AnomalyPatchExtractor.verify_saved_patch_split(tune_val_path)
-    AnomalyPatchExtractor.verify_saved_patch_split(final_test_path) 
+    AnomalyPatchExtractor.verify_saved_patch_split(final_test_path)
+    
+    # 4) Extract and process test labels
+    print("\n=== Extracting and Processing Test Labels ===")
+    tune_train_labels_path, tune_val_labels_path, final_test_labels_path = extractor.extract_and_process_test_labels(save_dir=save_dir)
+    AnomalyPatchExtractor.verify_saved_patch_split(tune_train_labels_path)
+    AnomalyPatchExtractor.verify_saved_patch_split(tune_val_labels_path)
+    AnomalyPatchExtractor.verify_saved_patch_split(final_test_labels_path) 

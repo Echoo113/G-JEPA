@@ -28,3 +28,8 @@ print(f"Shape: {test_labels.shape}")
 print(f"Dtype: {test_labels.dtype}")
 print(f"Unique values: {np.unique(test_labels)}")
 print(f"Example: {test_labels[:20]}")
+
+#print the true label ratio in test_labels
+print(f"True label ratio in test_labels: {np.sum(test_labels)/len(test_labels)}")
+#print first true label index in test_labels
+print(f"First true label index in test_labels: {np.where(test_labels == 1)[0][0]}")

@@ -6,23 +6,21 @@ from preprocess.datatool import DataTool
 
 # ====== Global Constants ======
 DEFAULT_FILENAME   = "data/SOLAR/solar_10_minutes_dataset.csv"
-INPUT_LEN          = 96    # Number of time steps in each input window
-OUTPUT_LEN         = 96    # Number of time steps in each output window
-WINDOW_STRIDE      = 48     # Sliding‐window stride for generating (input, output) pairs
-TRAIN_RATIO        = 0.8   # Fraction of total windows used for training
-VALID_RATIO        = 0.1   # Fraction of total windows used for validation (after training)
+WINDOW_LEN         = 96    # 每个窗口的长度
+WINDOW_STRIDE      = 96    # 窗口步长，设置为与窗口长度相同，确保不重叠
+TRAIN_RATIO        = 0.8   # 训练集比例
+VALID_RATIO        = 0.1   # 验证集比例
 
-# Default patch settings within each 96‐step window
-PATCH_LEN          = 16    # Length of each patch inside a 96‐step window
-PATCH_STRIDE       = 8     # Stride for patch extraction within a 96‐step window
+# Patch 设置
+PATCH_LEN          = 16    # 每个 patch 的长度
+PATCH_STRIDE       = 16    # patch 步长，设置为与 patch 长度相同，确保不重叠
 
 
 class PatchExtractor:
     def __init__(
         self,
         filename: str             = DEFAULT_FILENAME,
-        input_len: int            = INPUT_LEN,
-        output_len: int           = OUTPUT_LEN,
+        window_len: int           = WINDOW_LEN,
         window_stride: int        = WINDOW_STRIDE,
         train_ratio: float        = TRAIN_RATIO,
         valid_ratio: float        = VALID_RATIO,
@@ -31,8 +29,7 @@ class PatchExtractor:
         debug: bool               = False
     ):
         self.data_tool    = DataTool(filename, debug=debug)
-        self.input_len    = input_len
-        self.output_len   = output_len
+        self.window_len   = window_len
         self.window_stride= window_stride
         self.train_ratio  = train_ratio
         self.valid_ratio  = valid_ratio
@@ -40,55 +37,75 @@ class PatchExtractor:
         self.patch_stride = patch_stride
         self.debug        = debug
 
-    def _extract_sliding_windows(self, data: np.ndarray) -> tuple:
+    def _extract_sliding_windows(self, data: np.ndarray) -> np.ndarray:
         """
-        From a standardized multivariate time series (T, C),
-        extract all (input_window, output_window) pairs via sliding window.
-
+        从标准化后的多变量时间序列 (T, C) 中提取不重叠的窗口。
+        
         Returns:
-            x_windows: np.ndarray, shape = (N, input_len, C)
-            y_windows: np.ndarray, shape = (N, output_len, C)
+            windows: np.ndarray, shape = (N, window_len, C)
         """
         T, C = data.shape
-        window_size = self.input_len + self.output_len
-        max_start = T - window_size + 1
-        x_list, y_list = [], []
+        max_start = T - self.window_len + 1
+        windows = []
 
         for start in range(0, max_start, self.window_stride):
-            x_win = data[start : start + self.input_len]                   # (input_len, C)
-            y_win = data[start + self.input_len : start + window_size]     # (output_len, C)
-            x_list.append(x_win)
-            y_list.append(y_win)
+            window = data[start : start + self.window_len]  # (window_len, C)
+            windows.append(window)
 
-        x_windows = np.stack(x_list, axis=0)  # (N, input_len, C)
-        y_windows = np.stack(y_list, axis=0)  # (N, output_len, C)
-        return x_windows, y_windows
+        return np.stack(windows, axis=0)  # (N, window_len, C)
 
-    def _split_windows_into_patches(self, windows: np.ndarray) -> np.ndarray:
+    def _split_window_into_patches(self, window: np.ndarray, window_start_idx: int = 0) -> tuple:
         """
-        Given windows: np.ndarray of shape (N_windows, window_len, C),
-        split each window into patches of length patch_len with stride patch_stride.
-
+        将单个窗口分割成不重叠的 patches。
+        
+        Args:
+            window: np.ndarray of shape (window_len, C)
+            window_start_idx: 窗口在整个序列中的起始索引
+            
         Returns:
-            patches: np.ndarray of shape (N_windows, num_patches, patch_len, C)
+            x_patches: np.ndarray of shape (num_patches-1, patch_len, C)
+            y_patches: np.ndarray of shape (num_patches-1, patch_len, C)
         """
-        N_windows, window_len, C = windows.shape
-        # Calculate number of patches per window
-        num_patches = (window_len - self.patch_len) // self.patch_stride + 1
-
-        # Initialize output array
-        patches = np.zeros((N_windows, num_patches, self.patch_len, C), dtype=windows.dtype)
-
-        for i in range(N_windows):
-            for j in range(num_patches):
-                start = j * self.patch_stride
-                patches[i, j] = windows[i, start : start + self.patch_len]
-
-        return patches  # shape: (N_windows, num_patches, patch_len, C)
+        window_len, C = window.shape
+        num_patches = window_len // self.patch_len
+        
+        if self.debug:
+            print(f"\n=== Window Patch Analysis ===")
+            print(f"Window start index: {window_start_idx}")
+            print(f"Window length: {window_len}")
+            print(f"Number of patches per window: {num_patches}")
+            print(f"Each patch length: {self.patch_len}")
+        
+        # 初始化 patches 数组
+        patches = np.zeros((num_patches, self.patch_len, C), dtype=window.dtype)
+        
+        # 提取所有 patches
+        for i in range(num_patches):
+            start = i * self.patch_len
+            end = start + self.patch_len
+            patches[i] = window[start:end]
+            if self.debug:
+                print(f"Patch {i}: [{window_start_idx + start}:{window_start_idx + end}]")
+        
+        # 构造输入和输出
+        x_patches = patches[:-1]  # 除了最后一个 patch
+        y_patches = patches[1:]   # 除了第一个 patch
+        
+        if self.debug:
+            print("\n=== Patch Pairs ===")
+            for i in range(len(x_patches)):
+                x_start = window_start_idx + i * self.patch_len
+                x_end = x_start + self.patch_len
+                y_start = window_start_idx + (i + 1) * self.patch_len
+                y_end = y_start + self.patch_len
+                print(f"Pair {i}:")
+                print(f"  X: [{x_start}:{x_end}] → Y: [{y_start}:{y_end}]")
+        
+        return x_patches, y_patches
 
     def _split_indices(self, total_windows: int) -> tuple:
         """
-        Given total number of windows N, compute indices for train/valid/test splits.
+        计算训练/验证/测试集的索引。
         """
         n_train = int(total_windows * self.train_ratio)
         n_valid = int(total_windows * self.valid_ratio)
@@ -101,35 +118,57 @@ class PatchExtractor:
 
     def extract_and_store_all(self, save_dir: str = "data/SOLAR/patches"):
         """
-        Extract sliding‐window patches (both input and output) from the entire dataset,
-        split into train/valid/test, and save each split as .npz with patch arrays.
+        提取不重叠窗口的 patches，分割为训练/验证/测试集，并保存为 .npz 文件。
         """
         os.makedirs(save_dir, exist_ok=True)
 
-        # 1) Load & standardize whole dataset
+        # 1) 加载并标准化整个数据集
         data = self.data_tool.get_data()  # shape = (T, C)
+        
+        if self.debug:
+            print("\n=== Dataset Info ===")
+            print(f"Total time steps: {data.shape[0]}")
+            print(f"Number of features: {data.shape[1]}")
 
-        # 2) Extract all sliding windows (x_windows, y_windows)
-        x_all, y_all = self._extract_sliding_windows(data)
-        N, _, C = x_all.shape
+        # 2) 提取所有不重叠窗口
+        windows = self._extract_sliding_windows(data)
+        N = len(windows)
+        
+        if self.debug:
+            print(f"\n=== Window Info ===")
+            print(f"Total number of windows: {N}")
+            print(f"Window length: {self.window_len}")
+            print(f"Window stride: {self.window_stride}")
 
-        # 3) Convert each window into patches
-        #    x_all: (N, input_len, C) → x_patches_all: (N, num_patches_in, patch_len, C)
-        #    y_all: (N, output_len, C) → y_patches_all: (N, num_patches_out, patch_len, C)
-        x_patches_all = self._split_windows_into_patches(x_all)
-        y_patches_all = self._split_windows_into_patches(y_all)
+        # 3) 将每个窗口分割成 patches
+        x_patches_list = []
+        y_patches_list = []
+        
+        for i, window in enumerate(windows):
+            window_start_idx = i * self.window_stride
+            if self.debug and i < 2:  # 只打印前两个窗口的信息
+                print(f"\nProcessing window {i} (start index: {window_start_idx}):")
+            x_patches, y_patches = self._split_window_into_patches(window, window_start_idx)
+            x_patches_list.append(x_patches)
+            y_patches_list.append(y_patches)
+        
+        x_patches_all = np.stack(x_patches_list, axis=0)  # (N, num_patches-1, patch_len, C)
+        y_patches_all = np.stack(y_patches_list, axis=0)  # (N, num_patches-1, patch_len, C)
 
         if self.debug:
-            print("=== After splitting into patches ===")
+            print("\n=== Final Patch Shapes ===")
             print(f"x_patches_all shape: {x_patches_all.shape}")
             print(f"y_patches_all shape: {y_patches_all.shape}")
+            print(f"Number of patches per window: {x_patches_all.shape[1]}")
+            print(f"Patch length: {x_patches_all.shape[2]}")
+            print(f"Number of features: {x_patches_all.shape[3]}")
 
-        # 4) Determine train/valid/test indices over windows
+        # 4) 确定训练/验证/测试集的索引
         (t0, t1), (v0, v1), (s0, s1) = self._split_indices(N)
 
-        # 5) Slice patches by index
-        x_train_patches = x_patches_all[t0:t1]  # (n_train, num_patches_in, patch_len, C)
-        y_train_patches = y_patches_all[t0:t1]  # (n_train, num_patches_out, patch_len, C)
+        # 5) 按索引分割 patches
+        x_train_patches = x_patches_all[t0:t1]
+        y_train_patches = y_patches_all[t0:t1]
 
         x_valid_patches = x_patches_all[v0:v1]
         y_valid_patches = y_patches_all[v0:v1]
@@ -143,7 +182,7 @@ class PatchExtractor:
             print(f"Valid x patches: {x_valid_patches.shape}, Valid y patches: {y_valid_patches.shape}")
             print(f"Test  x patches: {x_test_patches.shape},  Test y patches: {y_test_patches.shape}")
 
-        # 6) Save each split into .npz
+        # 6) 保存每个分割为 .npz 文件
         train_path = os.path.join(save_dir, "solar_train.npz")
         valid_path = os.path.join(save_dir, "solar_val.npz")
         test_path  = os.path.join(save_dir, "solar_test.npz")

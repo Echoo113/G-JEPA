@@ -1,11 +1,10 @@
-import math
 import torch
 import torch.nn as nn
-
+import math
 
 class PositionalEncoding(nn.Module):
     """
-    动态生成的正弦-余弦位置编码（不使用固定 max_len）
+    正弦-余弦位置编码模块，为Transformer添加时间顺序信息
     """
     def __init__(self, d_model: int):
         super().__init__()
@@ -14,55 +13,46 @@ class PositionalEncoding(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: Tensor, shape = (B, N, D)
+            x: 输入张量，形状为 (B, N, D)
         Returns:
-            Tensor, same shape, 加上位置编码
+            加入位置编码后的张量，形状不变
         """
         B, N, D = x.shape
         device = x.device
 
-        position = torch.arange(N, dtype=torch.float, device=device).unsqueeze(1)  # (N, 1)
-        div_term = torch.exp(
-            torch.arange(0, D, 2, device=device).float() * (-math.log(10000.0) / D)
-        )
+        # 生成位置索引 (N, 1)
+        position = torch.arange(N, dtype=torch.float, device=device).unsqueeze(1)
+        # 计算位置频率项 (D//2,)
+        div_term = torch.exp(torch.arange(0, D, 2, device=device).float() * (-math.log(10000.0) / D))
 
+        # 初始化位置编码矩阵 (N, D)
         pe = torch.zeros(N, D, device=device)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # → (1, N, D)
+        pe[:, 0::2] = torch.sin(position * div_term)  # 偶数位置为sin
+        pe[:, 1::2] = torch.cos(position * div_term)  # 奇数位置为cos
+        pe = pe.unsqueeze(0)  # (1, N, D)，方便与输入相加
         return x + pe
-
 
 class MyTimeSeriesEncoder(nn.Module):
     """
-    改进版 TimeSeriesEncoder，保留 Patch 内部时序特征后再聚合到 latent
-    
-    针对 MSL 数据集优化：
-    - 输入: (B, 9, 20, 55) - 9个patch，每个patch 20步，55个传感器
-    - 输出: (B, 9, 128) - 9个patch的latent表示
+    改进版时间序列Encoder：
+    - 保留patch内部的时间结构和变量关系
+    - 使用Transformer编码时序特征，不使用平均池化或flatten操作
+    - 使用CLS Token方式聚合每个patch表示
+
+    输入形状: (B, N, 16, 137) 表示每个batch有N个patch，每个patch 16个时间步，137个变量
+    输出形状: (B, N, 1024) 表示每个patch编码为1024维的latent表示
     """
     def __init__(
         self,
-        patch_length: int = 20,      # MSL: 每个patch 20步
-        num_vars: int = 55,          # MSL: 55个传感器
-        latent_dim: int = 128,       # 降低到128维，减少计算量
-        time_layers: int = 2,        # 保持2层，视overfit情况调整
-        patch_layers: int = 3,       # 减少到3层，减轻计算负担
-        num_attention_heads: int = 8,
+        patch_length: int = 16,
+        num_vars: int = 137,
+        latent_dim: int = 1024,
+        time_layers: int = 2,
+        patch_layers: int = 3,
+        num_attention_heads: int = 16,
         ffn_dim: int = None,
         dropout: float = 0.1,
     ):
-        """
-        Args:
-            patch_length: 每个 patch 的时间步数 T (MSL: 20)
-            num_vars: 每个时间步的特征维度 F (MSL: 55)
-            latent_dim: 最终输出的 patch-level latent 维度 D (128)
-            time_layers: patch 内部时间 Transformer 层数 (2)
-            patch_layers: patch 级别 Transformer 层数 (3)
-            num_attention_heads: Attention 头数
-            ffn_dim: feed-forward 层维度，默认 4 * latent_dim
-            dropout: dropout 比例
-        """
         super().__init__()
         self.patch_length = patch_length
         self.num_vars = num_vars
@@ -71,92 +61,75 @@ class MyTimeSeriesEncoder(nn.Module):
         if ffn_dim is None:
             ffn_dim = latent_dim * 4
 
-        # —— 第一阶段：patch 内部时序编码
-        # 1) 1D Conv 将 (55 → hidden_dim)
-        self.hidden_dim = latent_dim // 2  # 128 → 64
-        self.conv1 = nn.Conv1d(
-            in_channels=num_vars,
-            out_channels=self.hidden_dim,
-            kernel_size=3,
-            padding=1
-        )
-        self.act = nn.GELU()
+        # 1）将变量维度137线性映射到hidden_dim维（默认256）
+        self.hidden_dim = latent_dim // 4
+        self.var_proj = nn.Linear(num_vars, self.hidden_dim)  # (16, 137) → (16, 256)
 
-        # 2) 时间位置编码 (20, hidden_dim)，可训练
-        self.time_pos_emb = nn.Parameter(torch.randn(patch_length, self.hidden_dim))
+        # 2）为每个patch加一个[CLS] token用于聚合
+        self.cls_token = nn.Parameter(torch.randn(1, 1, self.hidden_dim))  # (1, 1, 256)
 
-        # 3) 小型 TransformerEncoder 处理时间维度
-        encoder_layer_time = nn.TransformerEncoderLayer(
+        # 3）时间位置编码，用于区分时间步顺序
+        self.time_pos_encoder = PositionalEncoding(self.hidden_dim)
+
+        # 4）patch内部使用时间Transformer编码
+        encoder_layer = nn.TransformerEncoderLayer(
             d_model=self.hidden_dim,
-            nhead=min(self.hidden_dim // 16, 8),
+            nhead=min(self.hidden_dim // 16, 16),
             dim_feedforward=self.hidden_dim * 4,
             dropout=dropout,
             batch_first=True
         )
-        self.transformer_time = nn.TransformerEncoder(
-            encoder_layer_time,
-            num_layers=time_layers
-        )
+        self.time_encoder = nn.TransformerEncoder(encoder_layer, num_layers=time_layers)
 
-        # 4) 把 (20, hidden_dim) 平均池化或最大池化成 (hidden_dim)
-        #    然后映射到 latent_dim
-        self.fc_time2latent = nn.Linear(self.hidden_dim, latent_dim)
+        # 5）将[CLS] token提取出的表示投影为最终latent表示（1024）
+        self.cls_to_latent = nn.Linear(self.hidden_dim, latent_dim)
 
-        # —— 第二阶段：patch 级别编码
-        # 1) Patch‐level 位置编码
-        self.patch_pos_encoding = PositionalEncoding(latent_dim)
-
-        # 2) patch‐level TransformerEncoder
-        encoder_layer_patch = nn.TransformerEncoderLayer(
+        # 6）patch级位置编码 + Transformer（如果需要堆叠多个patch）
+        self.patch_pos_encoder = PositionalEncoding(latent_dim)
+        patch_encoder_layer = nn.TransformerEncoderLayer(
             d_model=latent_dim,
             nhead=num_attention_heads,
             dim_feedforward=ffn_dim,
             dropout=dropout,
             batch_first=True
         )
-        self.transformer_patch = nn.TransformerEncoder(
-            encoder_layer_patch,
-            num_layers=patch_layers
-        )
-
-        # 3) 最后 LayerNorm
+        self.patch_encoder = nn.TransformerEncoder(patch_encoder_layer, num_layers=patch_layers)
         self.norm = nn.LayerNorm(latent_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: Tensor, shape = (B, 9, 20, 55) - MSL数据集
+            x: 输入张量，形状为 (B, N, 16, 137)
         Returns:
-            Tensor, shape = (B, 9, 128) - 9个patch的latent表示
+            输出 latent 表示，形状为 (B, N, 1024)
         """
         B, N, T, F = x.shape
-        assert F == self.num_vars, f"输入特征维度 {F} 与 num_vars {self.num_vars} 不匹配"
+        assert F == self.num_vars
 
-        # —— Stage 1: patch 内部
-        # 把每个 patch 展成 (B*N, 55, 20)，做 1D Conv
-        x_ = x.view(B * N, T, F).transpose(1, 2)  # (B*N, 55, 20)
-        h = self.act(self.conv1(x_))             # (B*N, 64, 20)
+        # Step 1: 映射每个patch的变量维度，从137 → 256
+        x = self.var_proj(x)  # (B, N, 16, 256)
 
-        # 转置到 (B*N, 20, 64)，加时间位置编码
-        h = h.transpose(1, 2) + self.time_pos_emb.unsqueeze(0)  # (B*N, 20, 64)
+        # Step 2: 插入[CLS] token → (B, N, 17, 256)
+        cls = self.cls_token.expand(B * N, -1, -1)  # (B*N, 1, 256)
+        patch = x.view(B * N, T, -1)                # (B*N, 16, 256)
+        patch = torch.cat([cls, patch], dim=1)      # (B*N, 17, 256)
 
-        # 通过时间 Transformer，捕捉 patch 内部时序依赖
-        h = self.transformer_time(h)  # (B*N, 20, 64)
+        # Step 3: 加位置编码
+        patch = self.time_pos_encoder(patch)  # (B*N, 17, 256)
 
-        # 这里用平均池化得到 (B*N, 64)
-        h_pooled = h.mean(dim=1)       # (B*N, 64)
+        # Step 4: Transformer编码patch内部结构
+        patch_encoded = self.time_encoder(patch)  # (B*N, 17, 256)
 
-        # 映射到 latent_dim
-        patch_latent = self.fc_time2latent(h_pooled)  # (B*N, 128)
-        patch_latent = patch_latent.view(B, N, self.latent_dim)  # (B, 9, 128)
+        # Step 5: 提取[CLS] token表示作为patch表示
+        patch_cls = patch_encoded[:, 0]  # (B*N, 256)
 
-        # —— Stage 2: patch 级别
-        # 1) 加 Patch 位置编码
-        patch_latent = self.patch_pos_encoding(patch_latent)  # (B, 9, 128)
+        # Step 6: 映射为latent维度
+        patch_latent = self.cls_to_latent(patch_cls)  # (B*N, 1024)
+        patch_latent = patch_latent.view(B, N, self.latent_dim)  # (B, N, 1024)
 
-        # 2) 通过 patch‐level Transformer
-        y = self.transformer_patch(patch_latent)  # (B, 9, 128)
+        # Step 7: patch级编码（用于多个patch堆叠时建模）
+        patch_latent = self.patch_pos_encoder(patch_latent)
+        patch_latent = self.patch_encoder(patch_latent)
 
-        # 3) 最后归一化
-        y = self.norm(y)  # (B, 9, 128)
-        return y
+        # Step 8: 最后归一化
+        return self.norm(patch_latent)
