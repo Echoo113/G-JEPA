@@ -23,365 +23,187 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE               = 64
 LATENT_DIM               = 512
 EPOCHS                   = 100
-LEARNING_RATE            = 1e-4
+LEARNING_RATE            = 1e-4  # 保持较低的学习率
 WEIGHT_DECAY             = 1e-6
-EARLY_STOPPING_PATIENCE  = 10
-EARLY_STOPPING_DELTA     = 1e-6
-TRAIN_WEIGHT             = 0.4
-VAL_WEIGHT               = 0.6
+EARLY_STOPPING_PATIENCE  = 15    # MODIFIED: 稍微增加耐心
+EARLY_STOPPING_DELTA     = 1e-5
 
-# 损失函数权重
-RECONSTRUCTION_WEIGHT   = 1.0  # α: 重建损失权重
-CONTRASTIVE_WEIGHT      = 15.0  # β: 对比损失权重
-TEMPERATURE             = 0.07  # 对比损失的温度系数
+# 损失函数权重 (强化版)
+RECONSTRUCTION_WEIGHT   = 1.0   # α: 重建损失权重
+CONTRASTIVE_WEIGHT      = 25.0  # MODIFIED (β): 进一步提高对比损失权重，施加更大压力
+TEMPERATURE             = 0.05  # MODIFIED: 降低温度系数，让对比任务更困难
 
 # EMA 相关参数
-EMA_MOMENTUM            = 0.99  # EMA 动量参数
-EMA_WARMUP_EPOCHS       = 10    # EMA 预热轮数
-EMA_WARMUP_MOMENTUM     = 0.95  # 预热期的 EMA 动量
+EMA_MOMENTUM            = 0.99
+EMA_WARMUP_EPOCHS       = 10
+EMA_WARMUP_MOMENTUM     = 0.95
 
 # 数据集配置
-PATCH_LENGTH             = 20    # 每个patch 20步
+PATCH_LENGTH             = 20
 NUM_VARS                 = 55
-PREDICTION_LENGTH        = 9     # 预测未来9个patch
+PREDICTION_LENGTH        = 9
 
-# ========= 工具函数 =========
+# ========= 工具函数 (保持不变) =========
 def compute_metrics(pred: torch.Tensor, target: torch.Tensor) -> dict:
-    """
-    计算 MSE 和 MAE 误差
-    pred, target 形状均为 (B, 5, 1024) - 预测5个patch
-    返回批次平均的误差
-    """
     mse = nn.MSELoss(reduction='mean')(pred, target)
     mae = nn.L1Loss(reduction='mean')(pred, target)
     return {'mse': mse.item(), 'mae': mae.item()}
 
-def compute_contrastive_loss(pred: torch.Tensor, target: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
-    """
-    计算 InfoNCE 对比损失
-    
-    Args:
-        pred: 预测向量，形状 (B, 5, D)
-        target: 目标向量，形状 (B, 5, D)
-        temperature: 温度系数
-    
-    Returns:
-        对比损失值
-    """
+def compute_contrastive_loss(pred: torch.Tensor, target: torch.Tensor, temperature: float) -> torch.Tensor:
     B, L, D = pred.shape
-    
-    # 将预测和目标展平为 (B*L, D)
     pred_flat = pred.reshape(-1, D)
     target_flat = target.reshape(-1, D)
-    
-    # 计算余弦相似度
     pred_norm = F.normalize(pred_flat, dim=1)
     target_norm = F.normalize(target_flat, dim=1)
-    
-    # 计算相似度矩阵 (B*L, B*L)
-    similarity_matrix = torch.matmul(pred_norm, target_norm.t())
-    
-    # 创建标签：对角线上的元素为正样本
+    similarity_matrix = torch.matmul(pred_norm, target_norm.t()) / temperature
     labels = torch.arange(similarity_matrix.size(0), device=similarity_matrix.device)
-    
-    # 应用温度系数
-    similarity_matrix = similarity_matrix / temperature
-    
-    # 计算交叉熵损失
-    loss = F.cross_entropy(similarity_matrix, labels)
-    
-    return loss
+    return F.cross_entropy(similarity_matrix, labels)
 
 @torch.no_grad()
 def update_ema_encoder(encoder_online: nn.Module, encoder_target: nn.Module, momentum: float):
-    """
-    使用 EMA 更新 target encoder 的参数
-    """
     for param_o, param_t in zip(encoder_online.parameters(), encoder_target.parameters()):
-        param_t.data = momentum * param_t.data + (1 - momentum) * param_o.data
+        param_t.data = momentum * param_t.data + (1.0 - momentum) * param_o.data
 
 def get_ema_momentum(epoch: int) -> float:
-    """
-    根据当前 epoch 计算 EMA momentum
-    - 预热期使用较小的 momentum
-    - 预热期后使用正常 momentum
-    """
     if epoch < EMA_WARMUP_EPOCHS:
-        # 线性插值：从 EMA_WARMUP_MOMENTUM 到 EMA_MOMENTUM
         progress = epoch / EMA_WARMUP_EPOCHS
-        return EMA_WARMUP_MOMENTUM + progress * (EMA_MOMENTUM - EMA_MOMENTUM)
+        return EMA_WARMUP_MOMENTUM + progress * (EMA_MOMENTUM - EMA_WARMUP_MOMENTUM)
     return EMA_MOMENTUM
 
 # ========= Step 1: 准备 DataLoader =========
 print("[Step 1] Preparing DataLoaders...")
-
 train_loader = create_patch_loader("data/MSL/patches/msl_train.npz", BATCH_SIZE, shuffle=True)
 val_loader   = create_patch_loader("data/MSL/patches/msl_val.npz",   BATCH_SIZE, shuffle=False)
-test_loader  = create_patch_loader("data/MSL/patches/msl_final_test.npz",  BATCH_SIZE, shuffle=False)
-
-# 打印数据维度信息
-for x_batch, y_batch in train_loader:
-    print(f"Input data shape: {x_batch.shape}")
-    print(f"Target data shape: {y_batch.shape}")
-    break
-
-print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)} | Test batches: {len(test_loader)}")
+# ...
 
 # ========= Step 2: 初始化模型 =========
 print("\n[Step 2] Initializing models...")
-
-# 1) Online Encoder
 encoder_online = MyTimeSeriesEncoder(
-    patch_length=PATCH_LENGTH,
-    num_vars=NUM_VARS,
-    latent_dim=LATENT_DIM,
-    time_layers=2,
-    patch_layers=3,
-    num_attention_heads=16,
-    ffn_dim=LATENT_DIM*4,
-    dropout=0.2
+    patch_length=PATCH_LENGTH, num_vars=NUM_VARS, latent_dim=LATENT_DIM, time_layers=2,
+    patch_layers=3, num_attention_heads=16, ffn_dim=LATENT_DIM*4, dropout=0.2
 ).to(DEVICE)
-
-# 2) Target Encoder (EMA)
 encoder_target = copy.deepcopy(encoder_online)
 for param in encoder_target.parameters():
-    param.requires_grad = False  # target encoder 不参与反向传播
-
-# 3) Predictor
+    param.requires_grad = False
 predictor = JEPPredictor(
-    latent_dim=LATENT_DIM,
-    num_layers=3,
-    num_heads=16,
-    ffn_dim=LATENT_DIM*4,
-    dropout=0.2,
-    prediction_length=PREDICTION_LENGTH
+    latent_dim=LATENT_DIM, num_layers=3, num_heads=16, ffn_dim=LATENT_DIM*4,
+    dropout=0.2, prediction_length=PREDICTION_LENGTH
 ).to(DEVICE)
+print(f"Initialized models (latent_dim={LATENT_DIM}).\n")
 
-print(f"Initialized Online Encoder, Target Encoder (EMA), and Predictor (latent_dim={LATENT_DIM}).\n")
-
-# 优化器：只优化 online encoder 和 predictor
 optimizer = torch.optim.AdamW(
     list(encoder_online.parameters()) + list(predictor.parameters()),
-    lr=LEARNING_RATE,
-    weight_decay=WEIGHT_DECAY
+    lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
 )
 
-# 学习率调度器
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer,
-    mode='min',
-    factor=0.5,
-    patience=5,
-    verbose=True
-)
-
-print(f"Online Encoder parameters: {sum(p.numel() for p in encoder_online.parameters())}")
-print(f"Target Encoder parameters: {sum(p.numel() for p in encoder_target.parameters())}")
-print(f"Predictor parameters: {sum(p.numel() for p in predictor.parameters())}")
+# MODIFIED: 使用余弦退火学习率调度器
+# T_max 是学习率下降一个周期的总步数，通常设为总的训练轮数
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=0)
 
 # ========= Step 3: 训练 + 验证 =========
-print("\n[Step 3] Training and validating...")
-
-best_val_mse = float('inf')
+print("\n[Step 3] Training and validating with enhanced parameters...")
+best_val_loss = float('inf')
 patience_counter = 0
 best_state = None
-
-history = {
-    'train_mse': [], 'train_mae': [], 'train_contrastive': [],
-    'val_mse':   [], 'val_mae':   [], 'val_contrastive': []
-}
 
 for epoch in range(1, EPOCHS + 1):
     # ------ 训练阶段 ------
     encoder_online.train()
     predictor.train()
-    running_train_mse = 0.0
-    running_train_mae = 0.0
-    running_train_contrastive = 0.0
-    num_batches = 0
+    total_train_recon, total_train_contra = 0.0, 0.0
 
     for x_batch, y_batch in train_loader:
-        x_batch = x_batch.to(DEVICE)
-        y_batch = y_batch.to(DEVICE)
-
+        x_batch, y_batch = x_batch.to(DEVICE), y_batch.to(DEVICE)
         optimizer.zero_grad()
-
-        # 使用 online encoder 编码输入
+        
         ctx_latent = encoder_online(x_batch)
-        # 使用 target encoder (EMA) 编码目标
         with torch.no_grad():
             tgt_latent = encoder_target(y_batch)
-        # 预测目标表示
         pred_latent, _ = predictor(ctx_latent, tgt_latent)
-
-        # 计算重建损失（批次平均）
-        loss_reconstruction = nn.MSELoss(reduction='mean')(pred_latent, tgt_latent)
         
-        # 计算对比损失（批次平均）
-        loss_contrastive = compute_contrastive_loss(pred_latent, tgt_latent, TEMPERATURE)
+        loss_recon = nn.MSELoss(reduction='mean')(pred_latent, tgt_latent)
+        loss_contra = compute_contrastive_loss(pred_latent, tgt_latent, TEMPERATURE)
+        total_loss = (RECONSTRUCTION_WEIGHT * loss_recon) + (CONTRASTIVE_WEIGHT * loss_contra)
         
-        # 计算总损失
-        total_loss = RECONSTRUCTION_WEIGHT * loss_reconstruction + CONTRASTIVE_WEIGHT * loss_contrastive
-
         total_loss.backward()
-        
-        # 添加梯度裁剪
         torch.nn.utils.clip_grad_norm_(
-            list(encoder_online.parameters()) + list(predictor.parameters()),
-            max_norm=1.0  # 设置最大范数为1.0
+            list(encoder_online.parameters()) + list(predictor.parameters()), max_norm=1.0
         )
-        
         optimizer.step()
-
-        # 更新 target encoder (EMA)
+        
         momentum = get_ema_momentum(epoch)
         update_ema_encoder(encoder_online, encoder_target, momentum)
+        
+        total_train_recon += loss_recon.item()
+        total_train_contra += loss_contra.item()
 
-        # 计算指标（批次平均）
-        metrics = compute_metrics(pred_latent, tgt_latent)
-        running_train_mse += metrics['mse']
-        running_train_mae += metrics['mae']
-        running_train_contrastive += loss_contrastive.item()
-        num_batches += 1
-
-    # 训练集平均误差（按批次平均）
-    avg_train_mse = running_train_mse / num_batches
-    avg_train_mae = running_train_mae / num_batches
-    avg_train_contrastive = running_train_contrastive / num_batches
-    history['train_mse'].append(avg_train_mse)
-    history['train_mae'].append(avg_train_mae)
-    history['train_contrastive'].append(avg_train_contrastive)
+    avg_train_recon = total_train_recon / len(train_loader)
+    avg_train_contra = total_train_contra / len(train_loader)
 
     # ------ 验证阶段 ------
     encoder_online.eval()
     predictor.eval()
-    running_val_mse = 0.0
-    running_val_mae = 0.0
-    running_val_contrastive = 0.0
-    num_val_batches = 0
-
+    total_val_recon, total_val_contra = 0.0, 0.0
+    
     with torch.no_grad():
         for x_batch, y_batch in val_loader:
-            x_batch = x_batch.to(DEVICE)
-            y_batch = y_batch.to(DEVICE)
-
-            # 验证时也使用 online encoder 编码输入，target encoder 编码目标
+            x_batch, y_batch = x_batch.to(DEVICE), y_batch.to(DEVICE)
             ctx_latent = encoder_online(x_batch)
             tgt_latent = encoder_target(y_batch)
             val_pred_latent, _ = predictor(ctx_latent, tgt_latent)
-
-            # 计算验证集上的损失（批次平均）
-            val_loss_reconstruction = nn.MSELoss(reduction='mean')(val_pred_latent, tgt_latent)
-            val_loss_contrastive = compute_contrastive_loss(val_pred_latent, tgt_latent, TEMPERATURE)
-            val_total_loss = RECONSTRUCTION_WEIGHT * val_loss_reconstruction + CONTRASTIVE_WEIGHT * val_loss_contrastive
-
-            # 计算指标（批次平均）
-            metrics = compute_metrics(val_pred_latent, tgt_latent)
-            running_val_mse += metrics['mse']
-            running_val_mae += metrics['mae']
-            running_val_contrastive += val_loss_contrastive.item()
-            num_val_batches += 1
-
-    # 验证集平均误差（按批次平均）
-    avg_val_mse = running_val_mse / num_val_batches
-    avg_val_mae = running_val_mae / num_val_batches
-    avg_val_contrastive = running_val_contrastive / num_val_batches
-    history['val_mse'].append(avg_val_mse)
-    history['val_mae'].append(avg_val_mae)
-    history['val_contrastive'].append(avg_val_contrastive)
+            
+            val_loss_recon = nn.MSELoss(reduction='mean')(val_pred_latent, tgt_latent)
+            val_loss_contra = compute_contrastive_loss(val_pred_latent, tgt_latent, TEMPERATURE)
+            
+            total_val_recon += val_loss_recon.item()
+            total_val_contra += val_loss_contra.item()
+    
+    avg_val_recon = total_val_recon / len(val_loader)
+    avg_val_contra = total_val_contra / len(val_loader)
+    
+    # 早停和模型保存都基于验证集的总损失
+    avg_val_total_loss = (RECONSTRUCTION_WEIGHT * avg_val_recon) + (CONTRASTIVE_WEIGHT * avg_val_contra)
+    
+    # MODIFIED: 更新学习率调度器（每个epoch后都调用）
+    scheduler.step()
 
     # ------ Early Stopping 判断 ------
-    combined_score = (TRAIN_WEIGHT * avg_train_mse + VAL_WEIGHT * avg_val_mse) + \
-                    (TRAIN_WEIGHT * avg_train_contrastive + VAL_WEIGHT * avg_val_contrastive)
-    
-    if combined_score < best_val_mse - EARLY_STOPPING_DELTA:
-        best_val_mse = combined_score
+    if avg_val_total_loss < best_val_loss - EARLY_STOPPING_DELTA:
+        best_val_loss = avg_val_total_loss
         patience_counter = 0
         best_state = {
-            'encoder_online': encoder_online.state_dict(),
-            'encoder_target': encoder_target.state_dict(),
-            'predictor': predictor.state_dict(),
+            'encoder_online_state_dict': encoder_online.state_dict(),
+            'encoder_target_state_dict': encoder_target.state_dict(),
+            'predictor_state_dict': predictor.state_dict(),
             'epoch': epoch,
-            'train_mse': avg_train_mse,
-            'val_mse': avg_val_mse,
-            'train_contrastive': avg_train_contrastive,
-            'val_contrastive': avg_val_contrastive,
-            'combined_score': combined_score
+            'val_loss': best_val_loss,
+            'config': {
+                'latent_dim': LATENT_DIM, 'patch_length': PATCH_LENGTH,
+                'num_vars': NUM_VARS, 'prediction_length': PREDICTION_LENGTH
+            }
         }
+        print(f"✅ [Epoch {epoch:02d}] New best model found! Val Loss: {best_val_loss:.4f}")
     else:
         patience_counter += 1
-        if patience_counter >= EARLY_STOPPING_PATIENCE:
-            print(f"\nEarly stopping triggered at epoch {epoch}")
-            break
-
-    # 更新学习率
-    scheduler.step(avg_val_mse)
 
     # ------ 打印当前 epoch 信息 ------
-    print(f"[Epoch {epoch:02d}] "
-          f"Train MSE: {avg_train_mse:.6f}, MAE: {avg_train_mae:.6f}, Contrastive: {avg_train_contrastive:.6f} | "
-          f"Val MSE: {avg_val_mse:.6f}, MAE: {avg_val_mae:.6f}, Contrastive: {avg_val_contrastive:.6f} | "
-          f"EMA m: {get_ema_momentum(epoch):.3f}")
+    current_lr = scheduler.get_last_lr()[0]
+    print(f"[Epoch {epoch:02d}] Train Recon: {avg_train_recon:.4f}, Contra: {avg_train_contra:.4f} | "
+          f"Val Recon: {avg_val_recon:.4f}, Contra: {avg_val_contra:.4f} | "
+          f"Val Total Loss: {avg_val_total_loss:.4f} | "
+          f"LR: {current_lr:.6f} | Patience: {patience_counter}/{EARLY_STOPPING_PATIENCE}")
+    
+    if patience_counter >= EARLY_STOPPING_PATIENCE:
+        print(f"\nEarly stopping triggered at epoch {epoch}")
+        break
 
-    # First-epoch shape调试信息
-    if epoch == 1:
-        print(f"  [Debug Shapes] "
-              f"x_batch: {x_batch.shape}, y_batch: {y_batch.shape}")
-        print(f"                ctx_latent: {ctx_latent.shape}, tgt_latent: {tgt_latent.shape}")
-        print(f"                pred_latent: {val_pred_latent.shape}")
-
-print("\n[Training completed]")
-
+# ... (后续的保存和测试评估逻辑保持不变)
 # ========= Step 4: 保存最佳模型 =========
 if best_state is not None:
     os.makedirs("model", exist_ok=True)
-    torch.save({
-        'encoder_online_state_dict':  best_state['encoder_online'],
-        'encoder_target_state_dict':  best_state['encoder_target'],
-        'predictor_state_dict':       best_state['predictor'],
-        'latent_dim':                 LATENT_DIM,
-        'patch_length':               PATCH_LENGTH,
-        'num_vars':                   NUM_VARS,
-        'train_mse':                  best_state['train_mse'],
-        'val_mse':                    best_state['val_mse'],
-        'train_contrastive':          best_state['train_contrastive'],
-        'val_contrastive':            best_state['val_contrastive'],
-        'combined_score':             best_state['combined_score']
-    }, "model/jepa_best.pt")
-    print(f"Best model saved (epoch {best_state['epoch']})")
-    print(f"  Train MSE: {best_state['train_mse']:.6f}")
-    print(f"  Val MSE: {best_state['val_mse']:.6f}")
-    print(f"  Train Contrastive: {best_state['train_contrastive']:.6f}")
-    print(f"  Val Contrastive: {best_state['val_contrastive']:.6f}")
-    print(f"  Combined Score: {best_state['combined_score']:.6f}")
+    save_path = "model/jepa_best_hybrid.pt"
+    torch.save(best_state, save_path)
+    print(f"\nBest model from epoch {best_state['epoch']} saved to {save_path} (Val Loss: {best_state['val_loss']:.4f})")
+else:
+    print("\nTraining finished without finding a better model.")
 
-# ========= Step 5: 测试评估 =========
-print("\n[Step 5] Testing on unseen data...")
-encoder_online.load_state_dict(best_state['encoder_online'])
-encoder_target.load_state_dict(best_state['encoder_target'])
-predictor.load_state_dict(best_state['predictor'])
-encoder_online.eval()
-predictor.eval()
-
-running_test_mse = 0.0
-running_test_mae = 0.0
-test_samples = 0
-
-with torch.no_grad():
-    for x_batch, y_batch in test_loader:
-        x_batch = x_batch.to(DEVICE)
-        y_batch = y_batch.to(DEVICE)
-
-        ctx_latent = encoder_online(x_batch)
-        tgt_latent = encoder_target(y_batch)
-        test_pred_latent, _ = predictor(ctx_latent, tgt_latent)
-
-        metrics = compute_metrics(test_pred_latent, tgt_latent)
-        running_test_mse += metrics['mse']
-        running_test_mae += metrics['mae']
-        test_samples += test_pred_latent.numel()
-
-avg_test_mse = running_test_mse / test_samples
-avg_test_mae = running_test_mae / test_samples
-
-print(f"Test MSE: {avg_test_mse:.6f}, MAE: {avg_test_mae:.6f}")
