@@ -7,7 +7,7 @@ from preprocess.datatool import DataTool
 # ====== Global Constants ======
 DEFAULT_FILENAME   = "data/SOLAR/solar_10_minutes_dataset.csv"
 WINDOW_LEN         = 96    # 每个窗口的长度
-WINDOW_STRIDE      = 24    # 窗口步长
+WINDOW_STRIDE      = 48    # 窗口步长
 TRAIN_RATIO        = 0.8   # 训练集比例
 VALID_RATIO        = 0.1   # 验证集比例
 
