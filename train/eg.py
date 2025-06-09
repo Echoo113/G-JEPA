@@ -1,146 +1,141 @@
-import sys
 import os
-import numpy as np
+import sys
 import torch
-from itertools import product
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.neighbors import LocalOutlierFactor
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import f1_score, classification_report
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
 
-# --- 将项目根目录添加到Python路径中 ---
+# --- 将项目根目录添加到Python路径，确保可以导入自定义模块 ---
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+# --- 从你的项目中导入必要的模块 ---
 from jepa.encoder import MyTimeSeriesEncoder
+from patch_loader import AnomalyPatchExtractor # 假设你的数据加载器类叫这个名字
 
-# ==================== 配置 ====================
+# ========= 配置参数 (必须与你的训练脚本保持一致!) =========
+MODEL_PATH = "model/jepa_hybrid_best.pt"
+TUNE_TRAIN_DATA_PATH = "data/MSL/patches/msl_tune_train.npz"
+TUNE_TRAIN_LABELS_PATH = "data/MSL/patches/msl_tune_train_labels.npz"
+
+# --- 模型和数据维度配置 ---
+# 注意：这些参数必须和你训练时使用的完全一样！
+# 根据你之前提供的数据维度，这里已经帮你填好了
+PATCH_LENGTH = 20
+NUM_VARS = 55
+LATENT_DIM = 512 # 建议使用512，如果你训练时用了1024，请改回1024
+PREDICTION_LENGTH = 9
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-JEPA_CKPT_PATH = "model/jepa_best.pt"
 
-# --- 数据文件路径 ---
-# 用于调优的数据集（将会被合并）
-TRAIN_DATA_PATH = "data/MSL/patches/msl_tune_train.npz"
-TRAIN_LABEL_PATH = "data/MSL/patches/msl_tune_train_labels.npz"
-VAL_DATA_PATH = "data/MSL/patches/msl_tune_val.npz"
-VAL_LABEL_PATH = "data/MSL/patches/msl_tune_val_labels.npz"
-# 最终留出的、独立的测试集
-TEST_DATA_PATH = "data/MSL/patches/msl_final_test.npz"
-TEST_LABEL_PATH = "data/MSL/patches/msl_final_test_labels.npz"
+def main():
+    """
+    主执行函数
+    """
+    # ========= Step 1: 加载训练好的模型和Encoder权重 =========
+    print(f"[Step 1] 正在从 {MODEL_PATH} 加载模型...")
 
-BATCH_SIZE = 256
-CV_FOLDS = 5 # 使用5折交叉验证以进行更稳健的评估
+    if not os.path.exists(MODEL_PATH):
+        print(f"错误：找不到模型文件 {MODEL_PATH}。请先运行训练脚本。")
+        return
 
-# ==================== 辅助函数 ====================
-def extract_features(data_path, encoder):
-    """一个辅助函数，用于加载数据并通过编码器提取特征。"""
-    x_patches = np.load(data_path)['x_patches']
-    dataset = TensorDataset(torch.from_numpy(x_patches).float())
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE)
-    
-    all_latents = []
-    with torch.no_grad():
-        for window_batch in loader:
-            window_patches = window_batch[0].to(DEVICE)
-            latent_sequence = encoder(window_patches)
-            all_latents.append(latent_sequence.cpu())
-            
-    latents_np = torch.cat(all_latents).numpy()
-    return latents_np.reshape(-1, latents_np.shape[-1])
+    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
 
-# ==================== 主脚本 ====================
-if __name__ == "__main__":
-    ## 第1步: 加载预训练的JEPA编码器
-    print("## 第1步: 加载预训练的JEPA编码器...")
-    ckpt = torch.load(JEPA_CKPT_PATH, map_location=DEVICE, weights_only=True)
-    encoder = MyTimeSeriesEncoder(
-        patch_length=ckpt['patch_length'], num_vars=ckpt['num_vars'], latent_dim=ckpt['latent_dim']
+    # 重新实例化一个与训练时结构相同的Encoder
+    encoder_online = MyTimeSeriesEncoder(
+        patch_length=PATCH_LENGTH,
+        num_vars=NUM_VARS,
+        latent_dim=checkpoint.get('latent_dim', LATENT_DIM), # 优先从文件中读取维度
+        time_layers=2,
+        patch_layers=3,
+        num_attention_heads=16,
+        ffn_dim=checkpoint.get('latent_dim', LATENT_DIM) * 4,
+        dropout=0.2
     ).to(DEVICE)
-    encoder.load_state_dict(ckpt['encoder_state_dict'])
-    encoder.eval()
-    print("编码器加载成功。")
 
-    # ----------------------------------------------------------------
+    # 加载 online_encoder 的权重
+    encoder_online.load_state_dict(checkpoint['encoder_online'])
+    encoder_online.eval()  # 设置为评估模式
+    print("Online Encoder 加载成功并已设置为评估模式。")
 
-    ## 第2步: 创建用于调优的合并数据集 (训练集 + 验证集)
-    print("\n## 第2步: 创建用于调优的合并数据集 (训练集 + 验证集)...")
-    train_latents = extract_features(TRAIN_DATA_PATH, encoder)
-    train_labels = np.load(TRAIN_LABEL_PATH)['x_labels'].reshape(-1)
-    
-    val_latents = extract_features(VAL_DATA_PATH, encoder)
-    val_labels = np.load(VAL_LABEL_PATH)['x_labels'].reshape(-1)
-    
-    # 合并数据集
-    combined_latents = np.concatenate((train_latents, val_latents))
-    combined_labels = np.concatenate((train_labels, val_labels))
-    print(f"合并数据集创建完成。总Patch数: {len(combined_latents)}")
+    # ========= Step 2: 加载微调数据集和标签 =========
+    print("\n[Step 2] 正在加载微调数据集和标签...")
 
-    # ----------------------------------------------------------------
-    
-    ## 第3步: 在合并数据集上进行超参数搜索
-    print(f"\n## 第3步: 开始在合并数据集上进行 {CV_FOLDS}-折交叉验证网格搜索...")
-    anomaly_ratio = np.mean(combined_labels)
-    print(f"合并调优数据中的异常比例: {anomaly_ratio:.4f}")
+    try:
+        x_patches_data, _ = AnomalyPatchExtractor.load_patch_split(TUNE_TRAIN_DATA_PATH)
+        x_labels_data, _ = AnomalyPatchExtractor.load_patch_split(TUNE_TRAIN_LABELS_PATH)
+    except FileNotFoundError as e:
+        print(f"错误: 找不到数据文件 {e.filename}。请确保数据已生成。")
+        return
+        
+    print(f"  - 微调数据 (x_patches) 维度: {x_patches_data.shape}")
+    print(f"  - 微调标签 (x_labels) 维度: {x_labels_data.shape}")
 
-    param_grid = {
-        'n_neighbors': [50, 100, 150],
-        'contamination': [anomaly_ratio, anomaly_ratio * 1.2],
-        'p': [1, 2]
-    }
-    
-    keys, values = zip(*param_grid.items())
-    param_combinations = [dict(zip(keys, v)) for v in product(*values)]
-    results = {}
-    
-    skf = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=42)
+    # ========= Step 3: 准备数据并提取特征 =========
+    print("\n[Step 3] 正在准备数据并使用Encoder提取特征...")
 
-    for i, params in enumerate(param_combinations):
-        fold_scores = []
-        # print(f"  - 正在测试参数 {i+1}/{len(param_combinations)}: {params}")
-        for train_index, test_index in skf.split(combined_latents, combined_labels):
-            X_train, X_test = combined_latents[train_index], combined_latents[test_index]
-            y_train, y_test = combined_labels[train_index], combined_labels[test_index]
-            try:
-                lof = LocalOutlierFactor(novelty=True, **params)
-                lof.fit(X_train)
-                preds_raw = lof.predict(X_test)
-                preds = np.where(preds_raw == -1, 1, 0)
-                score = f1_score(y_test, preds, pos_label=1, zero_division=0.0)
-                fold_scores.append(score)
-            except Exception:
-                fold_scores.append(0.0)
-        results[tuple(params.items())] = np.mean(fold_scores)
-    
-    best_params_tuple = max(results, key=results.get)
-    best_params = dict(best_params_tuple)
-    best_score = results[best_params_tuple]
-    
-    print("超参数搜索完成。")
-    print("\n--- 最佳超参数组合 ---")
-    print(best_params)
-    print(f"\n最佳交叉验证F1分数: {best_score:.4f}")
-    
-    # ----------------------------------------------------------------
+    # 将数据从 (N, num_patches, patch_len, C) 展平为 (N * num_patches, patch_len, C)
+    # 这样每个补丁都成为一个独立的样本
+    num_samples, num_patches, _, _ = x_patches_data.shape
+    x_patches_flat = x_patches_data.reshape(-1, PATCH_LENGTH, NUM_VARS)
+    x_labels_flat = x_labels_data.reshape(-1)
 
-    ## 第4步: 使用最佳参数在所有调优数据上训练最终模型
-    print("\n## 第4步: 使用最佳参数在所有调优数据上训练最终模型...")
-    final_model = LocalOutlierFactor(novelty=True, **best_params)
-    final_model.fit(combined_latents)
-    print("最终模型训练完成。")
+    print(f"  - 已将数据展平，总补丁数: {x_patches_flat.shape[0]}")
 
-    # ----------------------------------------------------------------
-
-    ## 第5步: 在独立的测试集上评估最终模型
-    print("\n## 第5步: 在独立的测试集上评估最终模型...")
-    test_latents = extract_features(TEST_DATA_PATH, encoder)
-    test_labels = np.load(TEST_LABEL_PATH)['x_labels'].reshape(-1)
+    # 为了快速可视化，我们可以随机抽样一部分数据，例如2000个点
+    # 如果数据量不大或者你想分析全部数据，可以注释掉这部分
+    num_vis_samples = min(2000, x_patches_flat.shape[0])
+    print(f"  - 将随机抽样 {num_vis_samples} 个点进行t-SNE可视化...")
+    indices = np.random.choice(x_patches_flat.shape[0], num_vis_samples, replace=False)
     
-    test_preds_raw = final_model.predict(test_latents)
-    test_preds = np.where(test_preds_raw == -1, 1, 0)
+    x_sample = torch.tensor(x_patches_flat[indices], dtype=torch.float32).to(DEVICE)
+    labels_sample = x_labels_flat[indices]
 
-    print("\n" + "="*55)
-    print("### 最终模型在【独立测试集】上的性能报告 ###")
-    print("="*55)
-    print(classification_report(test_labels, test_preds, target_names=['正常 (Class 0)', '异常 (Class 1)']))
-    print("-" * 55)
+    # 使用Encoder提取特征
+    with torch.no_grad():
+        latent_vectors = encoder_online(x_sample).cpu().numpy()
+
+    print(f"  - 特征提取完成，特征向量维度: {latent_vectors.shape}")
+
+    # ========= Step 4: 使用t-SNE进行降维和可视化 =========
+    print("\n[Step 4] 正在使用t-SNE进行降维...")
+    tsne = TSNE(n_components=2, perplexity=30, n_iter=1000, random_state=42, verbose=1)
+    tsne_results = tsne.fit_transform(latent_vectors)
+    print("t-SNE降维完成。")
+
+    print("正在绘制特征空间散点图...")
+    plt.figure(figsize=(12, 10))
+    
+    # 分离正常点和异常点
+    normal_indices = np.where(labels_sample == 0)
+    anomaly_indices = np.where(labels_sample == 1)
+
+    # 绘制正常点 (蓝色)
+    plt.scatter(
+        tsne_results[normal_indices, 0], 
+        tsne_results[normal_indices, 1], 
+        label='正常 (Normal)', 
+        alpha=0.6, 
+        c='steelblue',
+        s=15 # 点的大小
+    )
+    # 绘制异常点 (红色)
+    plt.scatter(
+        tsne_results[anomaly_indices, 0], 
+        tsne_results[anomaly_indices, 1], 
+        label='异常 (Anomaly)', 
+        alpha=0.9, 
+        c='red',
+        s=25 # 让异常点更突出
+    )
+
+    plt.title('Encoder输出特征的t-SNE二维可视化', fontsize=16)
+    plt.xlabel('t-SNE 维度 1', fontsize=12)
+    plt.ylabel('t-SNE 维度 2', fontsize=12)
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+if __name__ == "__main__":
+    main()

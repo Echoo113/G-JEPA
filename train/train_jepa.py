@@ -9,6 +9,7 @@ if project_root not in sys.path:
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from patch_loader import create_patch_loader
@@ -23,11 +24,16 @@ BATCH_SIZE               = 32
 LATENT_DIM               = 1024
 EPOCHS                   = 100
 LEARNING_RATE            = 5e-4
-WEIGHT_DECAY            = 1e-6
+WEIGHT_DECAY             = 1e-6
 EARLY_STOPPING_PATIENCE  = 20
 EARLY_STOPPING_DELTA     = 1e-6
-TRAIN_WEIGHT            = 0.4
-VAL_WEIGHT              = 0.6
+TRAIN_WEIGHT             = 0.4
+VAL_WEIGHT               = 0.6
+
+# 损失函数权重
+RECONSTRUCTION_WEIGHT   = 1.0  # α: 重建损失权重
+CONTRASTIVE_WEIGHT      = 1.0  # β: 对比损失权重
+TEMPERATURE             = 0.07  # 对比损失的温度系数
 
 # EMA 相关参数
 EMA_MOMENTUM            = 0.99  # EMA 动量参数
@@ -44,10 +50,47 @@ def compute_metrics(pred: torch.Tensor, target: torch.Tensor) -> dict:
     """
     计算 MSE 和 MAE 误差
     pred, target 形状均为 (B, 5, 1024) - 预测5个patch
+    返回批次平均的误差
     """
-    mse = nn.MSELoss(reduction='sum')(pred, target)
-    mae = nn.L1Loss(reduction='sum')(pred, target)
+    mse = nn.MSELoss(reduction='mean')(pred, target)
+    mae = nn.L1Loss(reduction='mean')(pred, target)
     return {'mse': mse.item(), 'mae': mae.item()}
+
+def compute_contrastive_loss(pred: torch.Tensor, target: torch.Tensor, temperature: float = 0.07) -> torch.Tensor:
+    """
+    计算 InfoNCE 对比损失
+    
+    Args:
+        pred: 预测向量，形状 (B, 5, D)
+        target: 目标向量，形状 (B, 5, D)
+        temperature: 温度系数
+    
+    Returns:
+        对比损失值
+    """
+    B, L, D = pred.shape
+    
+    # 将预测和目标展平为 (B*L, D)
+    pred_flat = pred.reshape(-1, D)
+    target_flat = target.reshape(-1, D)
+    
+    # 计算余弦相似度
+    pred_norm = F.normalize(pred_flat, dim=1)
+    target_norm = F.normalize(target_flat, dim=1)
+    
+    # 计算相似度矩阵 (B*L, B*L)
+    similarity_matrix = torch.matmul(pred_norm, target_norm.t())
+    
+    # 创建标签：对角线上的元素为正样本
+    labels = torch.arange(similarity_matrix.size(0), device=similarity_matrix.device)
+    
+    # 应用温度系数
+    similarity_matrix = similarity_matrix / temperature
+    
+    # 计算交叉熵损失
+    loss = F.cross_entropy(similarity_matrix, labels)
+    
+    return loss
 
 @torch.no_grad()
 def update_ema_encoder(encoder_online: nn.Module, encoder_target: nn.Module, momentum: float):
@@ -66,15 +109,15 @@ def get_ema_momentum(epoch: int) -> float:
     if epoch < EMA_WARMUP_EPOCHS:
         # 线性插值：从 EMA_WARMUP_MOMENTUM 到 EMA_MOMENTUM
         progress = epoch / EMA_WARMUP_EPOCHS
-        return EMA_WARMUP_MOMENTUM + progress * (EMA_MOMENTUM - EMA_WARMUP_MOMENTUM)
+        return EMA_WARMUP_MOMENTUM + progress * (EMA_MOMENTUM - EMA_MOMENTUM)
     return EMA_MOMENTUM
 
 # ========= Step 1: 准备 DataLoader =========
 print("[Step 1] Preparing DataLoaders...")
 
-train_loader = create_patch_loader("data/SOLAR/patches/solar_train.npz", BATCH_SIZE, shuffle=True)
-val_loader   = create_patch_loader("data/SOLAR/patches/solar_val.npz",   BATCH_SIZE, shuffle=False)
-test_loader  = create_patch_loader("data/SOLAR/patches/solar_test.npz",  BATCH_SIZE, shuffle=False)
+train_loader = create_patch_loader("data/MSL/patches/msl_train.npz", BATCH_SIZE, shuffle=True)
+val_loader   = create_patch_loader("data/MSL/patches/msl_val.npz",   BATCH_SIZE, shuffle=False)
+test_loader  = create_patch_loader("data/MSL/patches/msl_final_test.npz",  BATCH_SIZE, shuffle=False)
 
 print(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)} | Test batches: {len(test_loader)}")
 
@@ -138,8 +181,8 @@ patience_counter = 0
 best_state = None
 
 history = {
-    'train_mse': [], 'train_mae': [],
-    'val_mse':   [], 'val_mae':   []
+    'train_mse': [], 'train_mae': [], 'train_contrastive': [],
+    'val_mse':   [], 'val_mae':   [], 'val_contrastive': []
 }
 
 for epoch in range(1, EPOCHS + 1):
@@ -148,7 +191,8 @@ for epoch in range(1, EPOCHS + 1):
     predictor.train()
     running_train_mse = 0.0
     running_train_mae = 0.0
-    train_samples = 0
+    running_train_contrastive = 0.0
+    num_batches = 0
 
     for x_batch, y_batch in train_loader:
         x_batch = x_batch.to(DEVICE)
@@ -162,33 +206,46 @@ for epoch in range(1, EPOCHS + 1):
         with torch.no_grad():
             tgt_latent = encoder_target(y_batch)
         # 预测目标表示
-        pred_latent, loss = predictor(ctx_latent, tgt_latent)
+        pred_latent, _ = predictor(ctx_latent, tgt_latent)
 
-        loss.backward()
+        # 计算重建损失（批次平均）
+        loss_reconstruction = nn.MSELoss(reduction='mean')(pred_latent, tgt_latent)
+        
+        # 计算对比损失（批次平均）
+        loss_contrastive = compute_contrastive_loss(pred_latent, tgt_latent, TEMPERATURE)
+        
+        # 计算总损失
+        total_loss = RECONSTRUCTION_WEIGHT * loss_reconstruction + CONTRASTIVE_WEIGHT * loss_contrastive
+
+        total_loss.backward()
         optimizer.step()
 
         # 更新 target encoder (EMA)
         momentum = get_ema_momentum(epoch)
         update_ema_encoder(encoder_online, encoder_target, momentum)
 
-        # 计算指标
+        # 计算指标（批次平均）
         metrics = compute_metrics(pred_latent, tgt_latent)
         running_train_mse += metrics['mse']
         running_train_mae += metrics['mae']
-        train_samples += pred_latent.numel()
+        running_train_contrastive += loss_contrastive.item()
+        num_batches += 1
 
-    # 训练集平均误差
-    avg_train_mse = running_train_mse / train_samples
-    avg_train_mae = running_train_mae / train_samples
+    # 训练集平均误差（按批次平均）
+    avg_train_mse = running_train_mse / num_batches
+    avg_train_mae = running_train_mae / num_batches
+    avg_train_contrastive = running_train_contrastive / num_batches
     history['train_mse'].append(avg_train_mse)
     history['train_mae'].append(avg_train_mae)
+    history['train_contrastive'].append(avg_train_contrastive)
 
     # ------ 验证阶段 ------
     encoder_online.eval()
     predictor.eval()
     running_val_mse = 0.0
     running_val_mae = 0.0
-    val_samples = 0
+    running_val_contrastive = 0.0
+    num_val_batches = 0
 
     with torch.no_grad():
         for x_batch, y_batch in val_loader:
@@ -200,15 +257,25 @@ for epoch in range(1, EPOCHS + 1):
             tgt_latent = encoder_target(y_batch)
             val_pred_latent, _ = predictor(ctx_latent, tgt_latent)
 
+            # 计算验证集上的损失（批次平均）
+            val_loss_reconstruction = nn.MSELoss(reduction='mean')(val_pred_latent, tgt_latent)
+            val_loss_contrastive = compute_contrastive_loss(val_pred_latent, tgt_latent, TEMPERATURE)
+            val_total_loss = RECONSTRUCTION_WEIGHT * val_loss_reconstruction + CONTRASTIVE_WEIGHT * val_loss_contrastive
+
+            # 计算指标（批次平均）
             metrics = compute_metrics(val_pred_latent, tgt_latent)
             running_val_mse += metrics['mse']
             running_val_mae += metrics['mae']
-            val_samples += val_pred_latent.numel()
+            running_val_contrastive += val_loss_contrastive.item()
+            num_val_batches += 1
 
-    avg_val_mse = running_val_mse / val_samples
-    avg_val_mae = running_val_mae / val_samples
+    # 验证集平均误差（按批次平均）
+    avg_val_mse = running_val_mse / num_val_batches
+    avg_val_mae = running_val_mae / num_val_batches
+    avg_val_contrastive = running_val_contrastive / num_val_batches
     history['val_mse'].append(avg_val_mse)
     history['val_mae'].append(avg_val_mae)
+    history['val_contrastive'].append(avg_val_contrastive)
 
     # ------ Early Stopping 判断 ------
     combined_score = TRAIN_WEIGHT * avg_train_mse + VAL_WEIGHT * avg_val_mse
@@ -236,8 +303,8 @@ for epoch in range(1, EPOCHS + 1):
 
     # ------ 打印当前 epoch 信息 ------
     print(f"[Epoch {epoch:02d}] "
-          f"Train MSE: {avg_train_mse:.6f}, MAE: {avg_train_mae:.6f} | "
-          f"Val MSE: {avg_val_mse:.6f}, MAE: {avg_val_mae:.6f} | "
+          f"Train MSE: {avg_train_mse:.6f}, MAE: {avg_train_mae:.6f}, Contrastive: {avg_train_contrastive:.6f} | "
+          f"Val MSE: {avg_val_mse:.6f}, MAE: {avg_val_mae:.6f}, Contrastive: {avg_val_contrastive:.6f} | "
           f"Combined: {combined_score:.6f} | "
           f"EMA m: {get_ema_momentum(epoch):.3f}")
 
