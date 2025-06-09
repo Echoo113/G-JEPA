@@ -23,7 +23,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE               = 64
 LATENT_DIM               = 512
 EPOCHS                   = 100
-LEARNING_RATE            = 5e-4
+LEARNING_RATE            = 1e-4
 WEIGHT_DECAY             = 1e-6
 EARLY_STOPPING_PATIENCE  = 20
 EARLY_STOPPING_DELTA     = 1e-6
@@ -32,7 +32,7 @@ VAL_WEIGHT               = 0.6
 
 # 损失函数权重
 RECONSTRUCTION_WEIGHT   = 1.0  # α: 重建损失权重
-CONTRASTIVE_WEIGHT      = 10.0  # β: 对比损失权重
+CONTRASTIVE_WEIGHT      = 15.0  # β: 对比损失权重
 TEMPERATURE             = 0.07  # 对比损失的温度系数
 
 # EMA 相关参数
@@ -224,6 +224,13 @@ for epoch in range(1, EPOCHS + 1):
         total_loss = RECONSTRUCTION_WEIGHT * loss_reconstruction + CONTRASTIVE_WEIGHT * loss_contrastive
 
         total_loss.backward()
+        
+        # 添加梯度裁剪
+        torch.nn.utils.clip_grad_norm_(
+            list(encoder_online.parameters()) + list(predictor.parameters()),
+            max_norm=1.0  # 设置最大范数为1.0
+        )
+        
         optimizer.step()
 
         # 更新 target encoder (EMA)
