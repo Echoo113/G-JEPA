@@ -19,7 +19,7 @@ from jepa.predictor import JEPPredictor
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 训练超参数
-BATCH_SIZE               = 64
+BATCH_SIZE               = 32
 LATENT_DIM               = 1024
 EPOCHS                   = 100
 LEARNING_RATE            = 5e-4
