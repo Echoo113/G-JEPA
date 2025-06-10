@@ -34,7 +34,7 @@ class Classifier(nn.Module):
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 训练超参数 (保持不变)
-BATCH_SIZE               = 64
+BATCH_SIZE               = 128
 LATENT_DIM               = 1024
 EPOCHS                   = 100
 LEARNING_RATE            = 1e-4
@@ -48,8 +48,8 @@ W2 = 5.0  # L2: 来自pred_latent的分类损失
 W3 = 5.0  # L3: 来自tgt_latent的分类损失
 
 # 自监督损失内部权重 (保持不变)
-RECONSTRUCTION_WEIGHT   = 5.0
-CONTRASTIVE_WEIGHT      = 10.0
+RECONSTRUCTION_WEIGHT   = 1.0
+CONTRASTIVE_WEIGHT      = 5.0
 TEMPERATURE             = 0.05
 
 # EMA 相关参数 (保持不变)
