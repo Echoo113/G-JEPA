@@ -259,6 +259,7 @@ for epoch in range(1, EPOCHS + 1):
         patience_counter = 0
         best_state = {
             'encoder_online_state_dict': encoder_online.state_dict(),
+            'encoder_target_state_dict': encoder_target.state_dict(),
             'predictor_state_dict': predictor.state_dict(),
             'classifier1_state_dict': classifier1.state_dict(),
             'classifier2_state_dict': classifier2.state_dict(),
