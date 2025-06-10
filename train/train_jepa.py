@@ -34,8 +34,8 @@ class Classifier(nn.Module):
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 训练超参数 (保持不变)
-BATCH_SIZE               = 128
-LATENT_DIM               = 1024
+BATCH_SIZE               = 64
+LATENT_DIM               = 512
 EPOCHS                   = 100
 LEARNING_RATE            = 1e-4
 WEIGHT_DECAY             = 1e-6
