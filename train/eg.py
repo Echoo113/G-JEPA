@@ -65,10 +65,10 @@ def main():
         ffn_dim=config['latent_dim'] * 4, dropout=0.2
     ).to(DEVICE)
 
-    # 加载 Target (EMA) Encoder 的权重，这对于下游任务是最佳实践
+    # 加载 Online Encoder 的权重
     encoder.load_state_dict(checkpoint['encoder_target_state_dict'])
     encoder.eval()  # 设置为评估模式
-    print("Target (EMA) Encoder 加载成功并已设置为评估模式。")
+    print("Online Encoder 加载成功并已设置为评估模式。")
 
     # ========= Step 2: 加载并重塑数据和标签 =========
     print("\n[Step 2] 正在加载并重塑微调数据集和标签...")
@@ -161,7 +161,7 @@ def main():
     plt.xlabel('t-SNE Dimension 1', fontsize=14)
     plt.ylabel('t-SNE Dimension 2', fontsize=14)
     plt.legend(fontsize=12)
-    plt.show()
+    plt.savefig('encoder_output_tsne.png')
    
 if __name__ == "__main__":
     main()

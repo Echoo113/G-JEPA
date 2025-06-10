@@ -24,10 +24,17 @@ print(f"Min: {np.min(test_data):.4f}, Max: {np.max(test_data):.4f}")
 print(f"Example rows:\n{test_data[:3]}")
 
 print("\n=== MSL_test_label.npy ===")
+#print count of 0 and 1 in test_labels
+print(f"Count of 0 in test_labels: {np.sum(test_labels==0)}")
+print(f"Count of 1 in test_labels: {np.sum(test_labels==1)}")
+#print 5 rows of test_labels
+
 print(f"Shape: {test_labels.shape}")
 print(f"Dtype: {test_labels.dtype}")
 print(f"Unique values: {np.unique(test_labels)}")
 print(f"Example: {test_labels[:20]}")
+#print the anomaly ratio in test_labels
+print(f"Anomaly ratio in test_labels: {np.sum(test_labels)/len(test_labels)}")
 
 #print the true label ratio in test_labels
 print(f"True label ratio in test_labels: {np.sum(test_labels)/len(test_labels)}")

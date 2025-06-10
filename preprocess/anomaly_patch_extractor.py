@@ -3,330 +3,445 @@ import numpy as np
 import pandas as pd
 from preprocess.datatool import DataTool
 
-# ====== 全局常量 (根据新逻辑更新) ======
-DEFAULT_FILENAME = "data/MSL/MSL_train.npy"
-DEFAULT_TEST_FILE = "data/MSL/MSL_test.npy"
-DEFAULT_TEST_LABEL_FILE = "data/MSL/MSL_test_label.npy"
+# ====== Global Constants ======
+DEFAULT_FILENAME   = "data/MSL/MSL_train.npy"
+DEFAULT_TEST_FILE  = "data/MSL/MSL_test.npy"  # 新增测试集文件路径
+INPUT_LEN          = 100   # Number of time steps in each input window
+OUTPUT_LEN         = 100   # Number of time steps in each output window
+WINDOW_STRIDE      = 20    # Sliding‐window stride for generating (input, output) pairs
+TRAIN_RATIO        = 0.9   # Fraction of total windows used for training
+VALID_RATIO        = 0.1   # Fraction of total windows used for validation (after training)
 
-# --- 以补丁为中心的设置 ---
-SEQ_LEN = 9          # 输入/输出序列中包含的补丁数量。
-PATCH_LEN = 20       # 每个补丁的时间步长度。
-PATCH_STRIDE = 10    # 提取补丁时的时间步长。
+# Default patch settings within each 100‐step window
+PATCH_LEN          = 20    # Length of each patch inside a 100‐step window
+PATCH_STRIDE       = 10    # Stride for patch extraction within a 100‐step window
 
-# --- 数据生成设置 ---
-WINDOW_STRIDE = 60   # 生成每个(输入, 目标)序列对时的滑动窗口步长。
-
-# --- 数据集划分比例 ---
-TRAIN_RATIO = 0.9      # 用于训练的总窗口比例。
-VALID_RATIO = 0.1      # 用于验证的总窗口比例。
-FINAL_TEST_RATIO = 0.2 # 从测试集中划分出的最终测试集比例。
-TUNE_VAL_RATIO = 0.1   # 从调优集中划分出的验证集比例。
+# 测试集划分比例
+FINAL_TEST_RATIO   = 2/10  # 最终测试集占比 (2/10)
+TUNE_VAL_RATIO     = 0.1   # 微调验证集占比 (10%)
 
 
 class AnomalyPatchExtractor:
-    """
-    修改后: 此类现在提取适用于自回归模型的重叠补丁序列
-    (例如, 从补丁N预测补丁N+1)。
-    """
     def __init__(
         self,
-        filename: str = DEFAULT_FILENAME,
-        seq_len: int = SEQ_LEN,
-        patch_len: int = PATCH_LEN,
-        patch_stride: int = PATCH_STRIDE,
-        window_stride: int = WINDOW_STRIDE,
-        train_ratio: float = TRAIN_RATIO,
-        debug: bool = False
+        filename: str             = DEFAULT_FILENAME,
+        input_len: int            = INPUT_LEN,
+        output_len: int           = OUTPUT_LEN,
+        window_stride: int        = WINDOW_STRIDE,
+        train_ratio: float        = TRAIN_RATIO,
+        valid_ratio: float        = VALID_RATIO,
+        patch_len: int            = PATCH_LEN,
+        patch_stride: int         = PATCH_STRIDE,
+        debug: bool               = False
     ):
-        """
-        修改后: 移除了 `input_len` 和 `output_len`。
-        现在的关键参数是 `seq_len` (序列中的补丁数量)。
-        """
-        self.data_tool = DataTool(filename, debug=debug)
-        self.seq_len = seq_len
-        self.patch_len = patch_len
+        self.data_tool    = DataTool(filename, debug=debug)
+        self.input_len    = input_len
+        self.output_len   = output_len
+        self.window_stride= window_stride
+        self.train_ratio  = train_ratio
+        self.valid_ratio  = valid_ratio
+        self.patch_len    = patch_len
         self.patch_stride = patch_stride
-        self.window_stride = window_stride
-        self.train_ratio = train_ratio
-        self.debug = debug
+        self.debug        = debug
 
-    def _create_sequences_from_data(self, data: np.ndarray) -> tuple:
+    def _extract_sliding_windows(self, data: np.ndarray) -> tuple:
         """
-        新增与重构: 这是核心的新函数。
-        它在原始数据上滑动一个"超级窗口"，并在每个位置上生成一个
-        (输入序列, 目标序列)的补丁对。目标序列是输入序列向右平移一个补丁的结果。
-
-        Args:
-            data: 原始时间序列数据，形状为 (T, C) 或 (T,)。
+        From a multivariate time series (T, C),
+        extract all (input_window, output_window) pairs via sliding window.
 
         Returns:
-            一个元组 (x_patch_sequences, y_patch_sequences)。
+            x_windows: np.ndarray, shape = (N, input_len, C)
+            y_windows: np.ndarray, shape = (N, output_len, C)
         """
-        # 如果数据是标签数组 (T,)，则重塑为 (T, 1) 以便统一处理。
-        is_label_data = (data.ndim == 1)
-        if is_label_data:
-            data = data.reshape(-1, 1)
-
         T, C = data.shape
-
-        # 1. 计算"超级窗口"的总时间步长度。
-        #    这个窗口必须足够长，以包含 seq_len + 1 个补丁。
-        total_ts_len = (self.seq_len * self.patch_stride) + self.patch_len
-
-        # 2. 在时间序列上滑动超级窗口。
-        x_sequences, y_sequences = [], []
-        max_start = T - total_ts_len + 1
+        window_size = self.input_len + self.output_len
+        max_start = T - window_size + 1
+        x_list, y_list = [], []
 
         for start in range(0, max_start, self.window_stride):
-            super_window = data[start : start + total_ts_len] # 形状: (total_ts_len, C)
+            x_win = data[start : start + self.input_len]                   # (input_len, C)
+            y_win = data[start + self.input_len : start + window_size]     # (output_len, C)
+            x_list.append(x_win)
+            y_list.append(y_win)
 
-            # 3. 将这个超级窗口分割成其所有的构成补丁。
-            #    这将产生 seq_len + 1 个补丁。
-            all_patches = self._split_window_into_patches(super_window) # 形状: (seq_len + 1, patch_len, C)
+        x_windows = np.stack(x_list, axis=0)  # (N, input_len, C)
+        y_windows = np.stack(y_list, axis=0)  # (N, output_len, C)
+        return x_windows, y_windows
 
-            # 4. 创建输入(x)和目标(y)序列。
-            #    x 是前 `seq_len` 个补丁。
-            #    y 是后 `seq_len` 个补丁 (即 x 向右平移一个单位)。
-            x_seq = all_patches[:-1]  # 形状: (seq_len, patch_len, C)
-            y_seq = all_patches[1:]   # 形状: (seq_len, patch_len, C)
-
-            x_sequences.append(x_seq)
-            y_sequences.append(y_seq)
-        
-        if not x_sequences:
-            raise ValueError("无法从数据中提取任何序列。请检查数据长度和窗口/补丁参数。")
-
-        x_stacked = np.stack(x_sequences, axis=0) # 形状: (N_sequences, seq_len, patch_len, C)
-        y_stacked = np.stack(y_sequences, axis=0) # 形状: (N_sequences, seq_len, patch_len, C)
-
-        # 如果是标签数据，则将最后一个维度压缩掉。
-        if is_label_data:
-            x_stacked = np.squeeze(x_stacked, axis=-1)
-            y_stacked = np.squeeze(y_stacked, axis=-1)
-
-        return x_stacked, y_stacked
-
-    def _split_window_into_patches(self, window: np.ndarray) -> np.ndarray:
+    def _split_windows_into_patches(self, windows: np.ndarray) -> np.ndarray:
         """
-        保留: 这是一个通用的辅助函数，未作更改。
-        给定单个窗口，将其分割成补丁。
-
-        Args:
-            window: np.ndarray，形状为 (window_len, C)。
+        Given windows: np.ndarray of shape (N_windows, window_len, C),
+        split each window into patches of length patch_len with stride patch_stride.
 
         Returns:
-            patches: np.ndarray，形状为 (num_patches, patch_len, C)。
+            patches: np.ndarray of shape (N_windows, num_patches, patch_len, C)
         """
-        window_len, C = window.shape
+        N_windows, window_len, C = windows.shape
+        # Calculate number of patches per window
         num_patches = (window_len - self.patch_len) // self.patch_stride + 1
-        
-        patches = np.zeros((num_patches, self.patch_len, C), dtype=window.dtype)
-        for i in range(num_patches):
-            start = i * self.patch_stride
-            patches[i] = window[start : start + self.patch_len]
 
-        return patches
+        # Initialize output array
+        patches = np.zeros((N_windows, num_patches, self.patch_len, C), dtype=windows.dtype)
 
-    def _split_indices(self, total_sequences: int) -> tuple:
+        for i in range(N_windows):
+            for j in range(num_patches):
+                start = j * self.patch_stride
+                patches[i, j] = windows[i, start : start + self.patch_len]
+
+        return patches  # shape: (N_windows, num_patches, patch_len, C)
+
+    def _split_indices(self, total_windows: int) -> tuple:
         """
-        保留: 用于分割索引的通用工具，未作更改。
+        Given total number of windows N, compute indices for train/valid splits.
+        Note: For MSL, we don't need test split as it's provided separately.
         """
-        n_train = int(total_sequences * self.train_ratio)
-        
+        n_train = int(total_windows * self.train_ratio)
+        n_valid = total_windows - n_train
+
         train_idx = (0, n_train)
-        valid_idx = (n_train, total_sequences)
+        valid_idx = (n_train, total_windows)
         return train_idx, valid_idx
 
     def extract_and_store_all(self, save_dir: str = "data/MSL/patches"):
         """
-        修改后: 提取、分割并存储训练集和验证集。
-        整个流程现在基于新的 `_create_sequences_from_data` 函数。
+        Extract sliding‐window patches (both input and output) from the entire dataset,
+        split into train/valid, and save each split as .npz with patch arrays.
         """
         os.makedirs(save_dir, exist_ok=True)
 
-        # 1) 加载原始训练数据
-        # MODIFIED: Now uses the real DataTool to load and standardize
-        self.data_tool.load()
-        data = self.data_tool.standardize()
+        # 1) Load raw dataset
+        data = self.data_tool.load()  # shape = (T, C)
         
         if self.debug:
-            print(f"\n=== 正在处理训练数据: {self.data_tool.path} ===")
-            print(f"原始数据形状: {data.shape}")
+            print("\n=== Raw Data Sample (First 5 timesteps, first 5 features) ===")
+            print(data[:5, :5])
+            print("\n=== Data Statistics ===")
+            print(f"Mean: {np.mean(data):.4f}")
+            print(f"Std: {np.std(data):.4f}")
+            print(f"Min: {np.min(data):.4f}")
+            print(f"Max: {np.max(data):.4f}")
 
-        # 2) 从数据中创建所有(输入, 目标)序列对
-        x_patches_all, y_patches_all = self._create_sequences_from_data(data)
-        N, _, _, _ = x_patches_all.shape
+        # 2) Extract all sliding windows (x_windows, y_windows)
+        x_all, y_all = self._extract_sliding_windows(data)
+        N, _, C = x_all.shape
+
         if self.debug:
-            print(f"已创建 {N} 个序列对。")
-            print(f"x_patches_all 形状: {x_patches_all.shape}")
-            print(f"y_patches_all 形状: {y_patches_all.shape}")
-        
-        # 3) 确定训练/验证集的索引
+            print("\n=== First Window Sample (First patch, first 5 timesteps, first 5 features) ===")
+            print("Input window:")
+            print(x_all[0, :5, :5])
+            print("\nOutput window:")
+            print(y_all[0, :5, :5])
+
+        # 3) Convert each window into patches
+        x_patches_all = self._split_windows_into_patches(x_all)
+        y_patches_all = self._split_windows_into_patches(y_all)
+
+        if self.debug:
+            print("\n=== First Patch Sample (First 5 timesteps, first 5 features) ===")
+            print("Input patch:")
+            print(x_patches_all[0, 0, :5, :5])
+            print("\nOutput patch:")
+            print(y_patches_all[0, 0, :5, :5])
+
+        if self.debug:
+            print("\n=== After splitting into patches ===")
+            print(f"x_patches_all shape: {x_patches_all.shape}")
+            print(f"y_patches_all shape: {y_patches_all.shape}")
+
+        # 4) Determine train/valid indices over windows
         (t0, t1), (v0, v1) = self._split_indices(N)
 
-        # 4) 根据索引切分补丁序列
-        x_train, y_train = x_patches_all[t0:t1], y_patches_all[t0:t1]
-        x_valid, y_valid = x_patches_all[v0:v1], y_patches_all[v0:v1]
-        if self.debug:
-            print(f"训练集 x/y 形状: {x_train.shape} / {y_train.shape}")
-            print(f"验证集 x/y 形状: {x_valid.shape} / {y_valid.shape}")
+        # 5) Slice patches by index
+        x_train_patches = x_patches_all[t0:t1]
+        y_train_patches = y_patches_all[t0:t1]
 
-        # 5) 将每个分割保存为.npz文件
+        x_valid_patches = x_patches_all[v0:v1]
+        y_valid_patches = y_patches_all[v0:v1]
+
+        if self.debug:
+            print("\n=== Split patch shapes ===")
+            print(f"Train x patches: {x_train_patches.shape}, Train y patches: {y_train_patches.shape}")
+            print(f"Valid x patches: {x_valid_patches.shape}, Valid y patches: {y_valid_patches.shape}")
+            print("\n=== Train/Valid Data Statistics ===")
+            print("Train data:")
+            print(f"Mean: {np.mean(x_train_patches):.4f}")
+            print(f"Std: {np.std(x_train_patches):.4f}")
+            print(f"Min: {np.min(x_train_patches):.4f}")
+            print(f"Max: {np.max(x_train_patches):.4f}")
+            print("\nValid data:")
+            print(f"Mean: {np.mean(x_valid_patches):.4f}")
+            print(f"Std: {np.std(x_valid_patches):.4f}")
+            print(f"Min: {np.min(x_valid_patches):.4f}")
+            print(f"Max: {np.max(x_valid_patches):.4f}")
+
+        # 6) Save each split into .npz
         train_path = os.path.join(save_dir, "msl_train.npz")
         valid_path = os.path.join(save_dir, "msl_val.npz")
 
-        np.savez_compressed(train_path, x_patches=x_train, y_patches=y_train)
-        np.savez_compressed(valid_path, x_patches=x_valid, y_patches=y_valid)
+        np.savez_compressed(train_path,
+                            x_patches=x_train_patches,
+                            y_patches=y_train_patches)
+        np.savez_compressed(valid_path,
+                            x_patches=x_valid_patches,
+                            y_patches=y_valid_patches)
 
         if self.debug:
-            print(f"\n已保存训练补丁到: {train_path}")
-            print(f"已保存验证补丁到: {valid_path}")
-        
+            print(f"\nSaved train patches to: {train_path}")
+            print(f"Saved valid patches to: {valid_path}")
+
         return train_path, valid_path
-        
-    def process_and_split_test_set(
-        self, 
-        test_filename: str = DEFAULT_TEST_FILE, 
-        label_filename: str = DEFAULT_TEST_LABEL_FILE, 
-        save_dir: str = "data/MSL/patches"
-    ):
+
+    def extract_test_set(self, test_filename: str = DEFAULT_TEST_FILE, save_dir: str = "data/MSL/patches"):
         """
-        新增与重构: 一个统一的函数来处理完整的测试流程：
-        加载测试数据和标签，创建序列，进行分割，并保存所有部分。
+        Extract (input, output) patches from MSL test set
+        
+        Args:
+            test_filename: Path to MSL test set file (default: data/MSL/MSL_test.npy)
+            save_dir: Directory to save the test patches (default: data/MSL/patches)
+            
+        Returns:
+            tuple: (x_test_patches, y_test_patches) - The extracted test patches
         """
         os.makedirs(save_dir, exist_ok=True)
 
-        # --- 1. 处理测试特征数据 ---
-        # MODIFIED: Use the real DataTool and reuse the scaler from training data
+        # 1) Load test dataset
         test_data_tool = DataTool(test_filename, debug=self.debug)
-        test_data_tool.load()
-        # IMPORTANT: Use the scaler from the training data to transform test data
-        test_data = self.data_tool.scaler.transform(test_data_tool.data)
-        
-        if self.debug:
-            print(f"\n=== 正在处理测试数据: {test_filename} ===")
-        x_test_all, y_test_all = self._create_sequences_from_data(test_data)
-        N_test = x_test_all.shape[0]
-        if self.debug:
-            print(f"已创建 {N_test} 个测试序列对。")
+        test_data = test_data_tool.load()  # shape = (T, C)
 
-        # --- 2. 处理测试标签数据 ---
-        # Label data does not need standardization
-        label_data_tool = DataTool(label_filename, debug=self.debug)
-        raw_labels = label_data_tool.load()
         if self.debug:
-            print(f"\n=== 正在处理标签数据: {label_filename} ===")
-        # 使用完全相同的方法创建标签序列
-        x_label_patches, y_label_patches = self._create_sequences_from_data(raw_labels)
-        
-        # 将每个标签补丁转换为单个二进制标签 (如果补丁内有任何异常，则为1)
-        x_labels = np.any(x_label_patches, axis=2).astype(np.int32)
-        y_labels = np.any(y_label_patches, axis=2).astype(np.int32)
-        
-        if self.debug:
-            print(f"处理后的标签形状 x/y: {x_labels.shape} / {y_labels.shape}")
-            print(f"x_labels中异常比例: {np.mean(x_labels):.4f}")
+            print("\n=== Test Data Sample (First 5 timesteps, first 5 features) ===")
+            print(test_data[:5, :5])
+            print("\n=== Test Data Statistics ===")
+            print(f"Mean: {np.mean(test_data):.4f}")
+            print(f"Std: {np.std(test_data):.4f}")
+            print(f"Min: {np.min(test_data):.4f}")
+            print(f"Max: {np.max(test_data):.4f}")
 
-        # --- 3. 分割特征和标签 ---
-        # 计算分割点
-        final_test_size = int(N_test * FINAL_TEST_RATIO)
-        tune_size = N_test - final_test_size
+        # 2) Extract sliding windows
+        x_test, y_test = self._extract_sliding_windows(test_data)
+
+        if self.debug:
+            print("\n=== First Test Window Sample (First patch, first 5 timesteps, first 5 features) ===")
+            print("Input window:")
+            print(x_test[0, :5, :5])
+            print("\nOutput window:")
+            print(y_test[0, :5, :5])
+
+        # 3) Convert windows into patches
+        x_test_patches = self._split_windows_into_patches(x_test)
+        y_test_patches = self._split_windows_into_patches(y_test)
+
+        if self.debug:
+            print("\n=== First Test Patch Sample (First 5 timesteps, first 5 features) ===")
+            print("Input patch:")
+            print(x_test_patches[0, 0, :5, :5])
+            print("\nOutput patch:")
+            print(y_test_patches[0, 0, :5, :5])
+            print("\n=== Test patch shapes ===")
+            print(f"Test x patches: {x_test_patches.shape}, Test y patches: {y_test_patches.shape}")
+            print("\n=== Test Patches Statistics ===")
+            print(f"Mean: {np.mean(x_test_patches):.4f}")
+            print(f"Std: {np.std(x_test_patches):.4f}")
+            print(f"Min: {np.min(x_test_patches):.4f}")
+            print(f"Max: {np.max(x_test_patches):.4f}")
+
+        return x_test_patches, y_test_patches
+
+    def split_test_into_tune_and_final(self, x_test_patches: np.ndarray, y_test_patches: np.ndarray, save_dir: str = "data/MSL/patches"):
+        """
+        将测试集划分为微调集和最终测试集
+        
+        Args:
+            x_test_patches: Test input patches array
+            y_test_patches: Test output patches array
+            save_dir: Directory to save the split results
+            
+        Returns:
+            tuple: (tune_train_path, tune_val_path, final_test_path)
+        """
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # 1) Calculate split sizes
+        final_test_size = int(len(x_test_patches) * FINAL_TEST_RATIO)  # 20% for final test
+        tune_size = len(x_test_patches) - final_test_size
+        
+        # 2) Split into final test and tuning sets
+        x_final_test = x_test_patches[-final_test_size:]
+        y_final_test = y_test_patches[-final_test_size:]
+        
+        x_tune_all = x_test_patches[:-final_test_size]
+        y_tune_all = y_test_patches[:-final_test_size]
+        
+        # 3) Further split tuning set into train and validation
         val_size = int(tune_size * TUNE_VAL_RATIO)
         train_size = tune_size - val_size
-
-        # 分割最终测试集
-        x_final_test, y_final_test = x_test_all[-final_test_size:], y_test_all[-final_test_size:]
-        x_labels_final_test, y_labels_final_test = x_labels[-final_test_size:], y_labels[-final_test_size:]
-
-        # 分割调优集
-        x_tune_all, y_tune_all = x_test_all[:-final_test_size], y_test_all[:-final_test_size]
-        x_labels_tune_all, y_labels_tune_all = x_labels[:-final_test_size], y_labels[:-final_test_size]
-
-        x_tune_train, y_tune_train = x_tune_all[:train_size], y_tune_all[:train_size]
-        x_labels_tune_train, y_labels_tune_train = x_labels_tune_all[:train_size], y_labels_tune_all[:train_size]
-
-        x_tune_val, y_tune_val = x_tune_all[train_size:], y_tune_all[train_size:]
-        x_labels_tune_val, y_labels_tune_val = x_labels_tune_all[train_size:], y_labels_tune_all[train_size:]
+        
+        x_tune_train = x_tune_all[:train_size]
+        y_tune_train = y_tune_all[:train_size]
+        
+        x_tune_val = x_tune_all[train_size:]
+        y_tune_val = y_tune_all[train_size:]
+        
+        # 4) Save all splits
+        tune_train_path = os.path.join(save_dir, "msl_tune_train.npz")
+        tune_val_path = os.path.join(save_dir, "msl_tune_val.npz")
+        final_test_path = os.path.join(save_dir, "msl_final_test.npz")
+        
+        np.savez_compressed(tune_train_path,
+                          x_patches=x_tune_train,
+                          y_patches=y_tune_train)
+        np.savez_compressed(tune_val_path,
+                          x_patches=x_tune_val,
+                          y_patches=y_tune_val)
+        np.savez_compressed(final_test_path,
+                          x_patches=x_final_test,
+                          y_patches=y_final_test)
         
         if self.debug:
-            print("\n=== 测试集分割结果 ===")
-            print(f"调优训练集大小: {x_tune_train.shape[0]}")
-            print(f"调优验证集大小: {x_tune_val.shape[0]}")
-            print(f"最终测试集大小: {x_final_test.shape[0]}")
+            print("\n=== Test Set Split Results ===")
+            print(f"MSLTuneTrain: {x_tune_train.shape[0]} patches")
+            print(f"MSLTuneValid: {x_tune_val.shape[0]} patches")
+            print(f"MSLTuneTest : {x_final_test.shape[0]} patches")
+        
+        return tune_train_path, tune_val_path, final_test_path
 
-        # --- 4. 保存所有分割 ---
-        paths = {}
-        # 保存特征
-        paths['tune_train'] = os.path.join(save_dir, "msl_tune_train.npz")
-        np.savez_compressed(paths['tune_train'], x_patches=x_tune_train, y_patches=y_tune_train)
-        paths['tune_val'] = os.path.join(save_dir, "msl_tune_val.npz")
-        np.savez_compressed(paths['tune_val'], x_patches=x_tune_val, y_patches=y_tune_val)
-        paths['final_test'] = os.path.join(save_dir, "msl_final_test.npz")
-        np.savez_compressed(paths['final_test'], x_patches=x_final_test, y_patches=y_final_test)
-        # 保存标签
-        paths['tune_train_labels'] = os.path.join(save_dir, "msl_tune_train_labels.npz")
-        np.savez_compressed(paths['tune_train_labels'], x_labels=x_labels_tune_train, y_labels=y_labels_tune_train)
-        paths['tune_val_labels'] = os.path.join(save_dir, "msl_tune_val_labels.npz")
-        np.savez_compressed(paths['tune_val_labels'], x_labels=x_labels_tune_val, y_labels=y_labels_tune_val)
-        paths['final_test_labels'] = os.path.join(save_dir, "msl_final_test_labels.npz")
-        np.savez_compressed(paths['final_test_labels'], x_labels=x_labels_final_test, y_labels=y_labels_final_test)
+    def extract_and_process_test_labels(self, label_filename: str = "data/MSL/MSL_test_label.npy", save_dir: str = "data/MSL/patches"):
+        """
+        处理测试集标签数据，将标签数据分割成与测试集数据相同的patch结构
+        
+        Args:
+            label_filename: 测试集标签文件路径
+            save_dir: 保存处理后的标签数据的目录
+            
+        Returns:
+            tuple: (tune_train_labels_path, tune_val_labels_path, final_test_labels_path)
+        """
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # 1) 加载标签数据
+        labels = np.load(label_filename)  # shape = (T,)
 
         if self.debug:
-            print("\n已保存所有测试集分割文件:")
-            for name, path in paths.items():
-                print(f"  - {name}: {path}")
+            print("\n=== Label Data Statistics ===")
+            print(f"Total labels: {len(labels)}")
+            print(f"Number of anomalies: {np.sum(labels)}")
+            print(f"Anomaly ratio: {np.sum(labels)/len(labels):.4f}")
         
-        return paths
+        # 2) 提取滑动窗口
+        x_windows, y_windows = self._extract_sliding_windows(labels.reshape(-1, 1))
+        
+        # 3) 将窗口转换为patches
+        x_patches = self._split_windows_into_patches(x_windows)
+        y_patches = self._split_windows_into_patches(y_windows)
+        
+        # 4) 对每个patch进行处理：如果patch中有任何一个True，则整个patch标记为1
+        x_patches_binary = np.any(x_patches, axis=2).astype(np.int32)
+        y_patches_binary = np.any(y_patches, axis=2).astype(np.int32)
+        
+        # 5) 按照与测试集数据相同的比例进行分割
+        final_test_size = int(len(x_patches_binary) * FINAL_TEST_RATIO)
+        tune_size = len(x_patches_binary) - final_test_size
+        
+        # 分割为最终测试集和调优集
+        x_final_test = x_patches_binary[-final_test_size:]
+        y_final_test = y_patches_binary[-final_test_size:]
+        
+        x_tune_all = x_patches_binary[:-final_test_size]
+        y_tune_all = y_patches_binary[:-final_test_size]
+        
+        # 进一步分割调优集为训练集和验证集
+        val_size = int(tune_size * TUNE_VAL_RATIO)
+        train_size = tune_size - val_size
+        
+        x_tune_train = x_tune_all[:train_size]
+        y_tune_train = y_tune_all[:train_size]
+        
+        x_tune_val = x_tune_all[train_size:]
+        y_tune_val = y_tune_all[train_size:]
+        
+        # 6) 保存所有分割
+        tune_train_labels_path = os.path.join(save_dir, "msl_tune_train_labels.npz")
+        tune_val_labels_path = os.path.join(save_dir, "msl_tune_val_labels.npz")
+        final_test_labels_path = os.path.join(save_dir, "msl_final_test_labels.npz")
+        
+        np.savez_compressed(tune_train_labels_path,
+                          x_labels=x_tune_train,
+                          y_labels=y_tune_train)
+        np.savez_compressed(tune_val_labels_path,
+                          x_labels=x_tune_val,
+                          y_labels=y_tune_val)
+        np.savez_compressed(final_test_labels_path,
+                          x_labels=x_final_test,
+                          y_labels=y_final_test)
+
+        if self.debug:
+            print("\n=== Label Split Results ===")
+            print(f"Tune Train Labels: {x_tune_train.shape[0]} patches")
+            print(f"Tune Valid Labels: {x_tune_val.shape[0]} patches")
+            print(f"Final Test Labels: {x_final_test.shape[0]} patches")
+            print("\n=== Label Statistics ===")
+            print(f"Tune Train Anomaly Ratio: {np.sum(x_tune_train)/x_tune_train.size:.4f}")
+            print(f"Tune Valid Anomaly Ratio: {np.sum(x_tune_val)/x_tune_val.size:.4f}")
+            print(f"Final Test Anomaly Ratio: {np.sum(x_final_test)/x_final_test.size:.4f}")
+        
+        return tune_train_labels_path, tune_val_labels_path, final_test_labels_path
 
     @staticmethod
     def load_patch_split(split_path: str) -> tuple:
         """
-        加载预先保存的 .npz 分割文件并返回 (x_patches, y_patches) numpy数组。
+        Load pre-saved .npz split and return (x_patches, y_patches) as numpy arrays.
+        Args:
+            split_path: path to one of msl_train_patches.npz, etc.
+        Returns:
+            x_patches: np.ndarray, shape=(N_split, num_patches_in, patch_len, C)
+            y_patches: np.ndarray, shape=(N_split, num_patches_out, patch_len, C)
         """
         data = np.load(split_path)
-        # 根据文件内容返回 patches 或 labels
-        if "x_patches" in data:
-            return data["x_patches"], data["y_patches"]
-        elif "x_labels" in data:
-            return data["x_labels"], data["y_labels"]
-        else:
-            raise KeyError("在 .npz 文件中未找到 'x_patches' 或 'x_labels'。")
+        return data["x_patches"], data["y_patches"]
 
     @staticmethod
     def verify_saved_patch_split(split_path: str):
         """
-        打印已保存的 .npz 分割文件中数组的形状。
+        Print shapes of x_patches and y_patches inside a saved .npz split.
         """
-        if not os.path.exists(split_path):
-            print(f"*** 文件不存在: {split_path} ***")
-            return
-            
         data = np.load(split_path)
-        print(f"*** {os.path.basename(split_path)} 的内容 ***")
+        print(f"*** Contents of {split_path} ***")
         for key in data:
-            print(f"  - {key}: {data[key].shape}")
+            print(f"{key}: {data[key].shape}")
+
 
 if __name__ == "__main__":
-    # 创建保存目录路径
+    # Create save directory path
     save_dir = "data/MSL/patches"
     
-    # 创建提取器实例并处理数据
+    # Create extractor and process data
     extractor = AnomalyPatchExtractor(debug=True)
     
-    # 1) 处理训练集和验证集
-    print("\n================== 1. 处理训练和验证集 ==================")
+    # 1) Process training and validation sets
+    print("\n=== Processing Training and Validation Sets ===")
     train_path, val_path = extractor.extract_and_store_all(save_dir=save_dir)
     AnomalyPatchExtractor.verify_saved_patch_split(train_path)
     AnomalyPatchExtractor.verify_saved_patch_split(val_path)
     
-    # 2) 统一处理测试集（包括数据和标签的分割与保存）
-    print("\n================== 2. 处理测试集和标签 ==================")
-    saved_paths = extractor.process_and_split_test_set(save_dir=save_dir)
+    # 2) Process test set
+    print("\n=== Processing Test Set ===")
+    x_test_patches, y_test_patches = extractor.extract_test_set(save_dir=save_dir)
+    if extractor.debug:
+        print("\n=== Test patch shapes ===")
+        print(f"Test x patches: {x_test_patches.shape}, Test y patches: {y_test_patches.shape}")
     
-    # 3) 验证所有生成的文件
-    print("\n================== 3. 验证所有已保存的文件 ==================")
-    for name, path in saved_paths.items():
-        if os.path.exists(path):
-            AnomalyPatchExtractor.verify_saved_patch_split(path)
-        else:
-            print(f"*** 文件不存在: {path} ***")
+    # 3) Split test set into tuning and final test sets
+    print("\n=== Splitting Test Set into Tuning and Final Test Sets ===")
+    tune_train_path, tune_val_path, final_test_path = extractor.split_test_into_tune_and_final(
+        x_test_patches, y_test_patches, save_dir=save_dir
+    )
+    AnomalyPatchExtractor.verify_saved_patch_split(tune_train_path)
+    AnomalyPatchExtractor.verify_saved_patch_split(tune_val_path)
+    AnomalyPatchExtractor.verify_saved_patch_split(final_test_path)
+    
+    # 4) Extract and process test labels
+    print("\n=== Extracting and Processing Test Labels ===")
+    tune_train_labels_path, tune_val_labels_path, final_test_labels_path = extractor.extract_and_process_test_labels(save_dir=save_dir)
+    AnomalyPatchExtractor.verify_saved_patch_split(tune_train_labels_path)
+    AnomalyPatchExtractor.verify_saved_patch_split(tune_val_labels_path)
+    AnomalyPatchExtractor.verify_saved_patch_split(final_test_labels_path) 
