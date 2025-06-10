@@ -47,9 +47,9 @@ def evaluate_model(encoder, classifier, data_loader, model_name):
     all_preds = []
     all_labels = []
 
-    for x_batch, _, labels_batch in data_loader:
+    for x_batch, y_batch, x_label, y_label in data_loader:
         x_batch = x_batch.to(DEVICE)
-        labels_batch = labels_batch.float()
+        labels_batch = y_label.float()  # 使用目标序列的标签
 
         latent = encoder(x_batch)  # shape: [B, SEQ, D]
         B, SEQ, D = latent.shape
@@ -144,17 +144,6 @@ def main():
     print("正在加载模型检查点...")
     checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True)
     
-    # === Debug: Print checkpoint contents ===
-    print("\n📋 Checkpoint 内容:")
-    print("-" * 50)
-    for key, value in checkpoint.items():
-        if isinstance(value, dict):
-            print(f"🔑 {key}:")
-            for subkey in value.keys():
-                print(f"  - {subkey}")
-        else:
-            print(f"🔑 {key}: {type(value)}")
-    print("-" * 50)
     
     config = checkpoint["config"]
 
