@@ -12,14 +12,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from patch_loader import create_labeled_loader  # 修正导入
+from patch_loader import get_loader  # 更新导入
 from jepa.encoder import MyTimeSeriesEncoder
 from jepa.predictor import JEPPredictor
 
 # ========= NEW: 定义分类器模型 =========
 class Classifier(nn.Module):
     """一个简单的MLP分类器，用于判断一个补丁的latent表示是否异常"""
-    def __init__(self, input_dim, hidden_dim=512, output_dim=1):
+    def __init__(self, input_dim, hidden_dim=256, output_dim=1):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -34,8 +34,8 @@ class Classifier(nn.Module):
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 训练超参数 (保持不变)
-BATCH_SIZE               = 64
-LATENT_DIM               = 512
+BATCH_SIZE               = 128
+LATENT_DIM               = 256
 EPOCHS                   = 100
 LEARNING_RATE            = 1e-4
 WEIGHT_DECAY             = 1e-6
@@ -44,12 +44,12 @@ EARLY_STOPPING_DELTA     = 1e-5
 
 # --- NEW: 三个损失的权重 ---
 W1 = 1.0  # L1: 自监督损失 (包含recon和contra)
-W2 = 5.0  # L2: 来自pred_latent的分类损失
-W3 = 5.0  # L3: 来自tgt_latent的分类损失
+W2 = 1.0  # L2: 来自pred_latent的分类损失
+W3 = 8.0  # L3: 来自tgt_latent的分类损失
 
 # 自监督损失内部权重 (保持不变)
-RECONSTRUCTION_WEIGHT   = 1.0
-CONTRASTIVE_WEIGHT      = 5.0
+RECONSTRUCTION_WEIGHT   = 0.1
+CONTRASTIVE_WEIGHT      = 1.0
 TEMPERATURE             = 0.05
 
 # EMA 相关参数 (保持不变)
@@ -58,9 +58,10 @@ EMA_WARMUP_EPOCHS       = 10
 EMA_WARMUP_MOMENTUM     = 0.95
 
 # 数据集配置 (保持不变)
-PATCH_LENGTH             = 20
-NUM_VARS                 = 55
-PREDICTION_LENGTH        = 9 # 你的Predictor预测的是9个补丁
+X_PATCH_LENGTH          = 30  # 修改为实际的输入序列长度
+NUM_VARS                = 1   # 修改为实际的变量数
+PREDICTION_STEPS        = 10  # 修改为实际的预测序列长度
+Y_PATCH_SIZE           = 10   # 修改为实际的预测序列长度
 
 # ========= 工具函数 (保持不变) =========
 def compute_contrastive_loss(pred: torch.Tensor, target: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -86,39 +87,68 @@ def get_ema_momentum(epoch: int) -> float:
 
 # ========= Step 1: 准备 DataLoader (MODIFIED) =========
 print("[Step 1] Preparing DataLoaders...")
-train_loader = create_labeled_loader(
-    feature_npz_path="data/MSL/patches/msl_tune_train.npz",
-    label_npz_path="data/MSL/patches/msl_tune_train_labels.npz",
+train_loader = get_loader(
+    npz_file="data/MSL/patches/train.npz",
     batch_size=BATCH_SIZE,
     shuffle=True
 )
-val_loader = create_labeled_loader(
-    feature_npz_path="data/MSL/patches/msl_tune_val.npz",
-    label_npz_path="data/MSL/patches/msl_tune_val_labels.npz",
+val_loader = get_loader(
+    npz_file="data/MSL/patches/val.npz",
     batch_size=BATCH_SIZE,
     shuffle=False
 )
 
 # ========= Step 2: 初始化模型 (MODIFIED) =========
 print("\n[Step 2] Initializing models...")
-# Encoder 和 Predictor 保持不变
+# 1. 编码历史patch的encoder (30步)
 encoder_online = MyTimeSeriesEncoder(
-    patch_length=PATCH_LENGTH, num_vars=NUM_VARS, latent_dim=LATENT_DIM, time_layers=2,
-    patch_layers=3, num_attention_heads=16, ffn_dim=LATENT_DIM*4, dropout=0.2
-).to(DEVICE)
-encoder_target = copy.deepcopy(encoder_online)
-for param in encoder_target.parameters():
-    param.requires_grad = False
-predictor = JEPPredictor(
-    latent_dim=LATENT_DIM, num_layers=3, num_heads=16, ffn_dim=LATENT_DIM*4,
-    dropout=0.2, prediction_length=PREDICTION_LENGTH
+    patch_length=X_PATCH_LENGTH,  # 30步
+    num_vars=NUM_VARS,
+    latent_dim=LATENT_DIM,
+    time_layers=2,
+    patch_layers=3,
+    num_attention_heads=16,
+    ffn_dim=LATENT_DIM*4,
+    dropout=0.2
 ).to(DEVICE)
 
-# --- NEW: 初始化两个独立的分类器 ---
+# 2. 编码未来patch的encoder (10步)
+encoder_target = MyTimeSeriesEncoder(
+    patch_length=Y_PATCH_SIZE,    # 10步，与predictor的patch_size保持一致
+    num_vars=NUM_VARS,
+    latent_dim=LATENT_DIM,
+    time_layers=2,
+    patch_layers=3,
+    num_attention_heads=16,
+    ffn_dim=LATENT_DIM*4,
+    dropout=0.2
+).to(DEVICE)
+
+# 3. 初始化target encoder的参数（使用online encoder的参数）
+for param_o, param_t in zip(encoder_online.parameters(), encoder_target.parameters()):
+    param_t.data.copy_(param_o.data)
+    param_t.requires_grad = False
+
+# 4. 初始化predictor
+predictor = JEPPredictor(
+    latent_dim=LATENT_DIM,
+    prediction_steps=PREDICTION_STEPS,
+    patch_size=Y_PATCH_SIZE,
+    num_layers=3,
+    num_heads=16,
+    ffn_dim=LATENT_DIM*4,
+    dropout=0.2
+).to(DEVICE)
+
+# 5. 初始化分类器
 classifier1 = Classifier(input_dim=LATENT_DIM).to(DEVICE)
 classifier2 = Classifier(input_dim=LATENT_DIM).to(DEVICE)
 
-print(f"Initialized models and classifiers (latent_dim={LATENT_DIM}).\n")
+print(f"Initialized models:")
+print(f"- encoder_online: patch_length={X_PATCH_LENGTH}")
+print(f"- encoder_target: patch_length={Y_PATCH_SIZE}")
+print(f"- predictor: prediction_steps={PREDICTION_STEPS}, patch_size={Y_PATCH_SIZE}")
+print(f"- latent_dim={LATENT_DIM}\n")
 
 # --- MODIFIED: 更新优化器，加入分类器参数 ---
 optimizer = torch.optim.AdamW(
@@ -126,7 +156,8 @@ optimizer = torch.optim.AdamW(
     list(predictor.parameters()) +
     list(classifier1.parameters()) +
     list(classifier2.parameters()),
-    lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+    lr=LEARNING_RATE,
+    weight_decay=WEIGHT_DECAY
 )
 
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=0)
@@ -143,31 +174,33 @@ bce_criterion = nn.BCEWithLogitsLoss()
 for epoch in range(1, EPOCHS + 1):
     # ------ 训练阶段 ------
     encoder_online.train()
+    encoder_target.train()  # 注意：虽然target encoder不参与反向传播，但需要设置为train模式以保持一致性
     predictor.train()
     classifier1.train()
     classifier2.train()
     total_train_L1, total_train_L2, total_train_L3 = 0.0, 0.0, 0.0
 
-    for batch in train_loader:
-        if len(batch) == 4:  # 带标签的数据
-            x_batch, y_batch, x_label, y_label = batch
-            labels_batch = y_label  # 使用目标序列的标签
-        else:  # 不带标签的数据
-            x_batch, y_batch = batch
-            labels_batch = torch.zeros(x_batch.size(0), 1, device=DEVICE)  # 默认标签为0
-            
+    for batch_idx, batch in enumerate(train_loader):
+        x_batch, y_batch, labels_batch = batch
         x_batch, y_batch = x_batch.to(DEVICE), y_batch.to(DEVICE)
         labels_batch = labels_batch.to(DEVICE)
+       
+        
+        # 添加N_patch维度，使输入变为4D: (B, N_patch, T, F)
+        x_batch = x_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
+        y_batch = y_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
+       
         
         optimizer.zero_grad()
         
         # --- L1 损失 (自监督) ---
-        ctx_latent = encoder_online(x_batch)
+        ctx_latent = encoder_online(x_batch)  # 编码30步的历史patch
         with torch.no_grad():
-            tgt_latent = encoder_target(y_batch)
-        pred_latent, _ = predictor(ctx_latent, tgt_latent)
+            tgt_latent = encoder_target(y_batch)  # 编码10步的未来patch
+        pred_latent, pred_loss = predictor(ctx_latent, tgt_latent)
+      
         
-        loss_recon = nn.MSELoss()(pred_latent, tgt_latent)
+        loss_recon = pred_loss  # 使用predictor返回的损失
         loss_contra = compute_contrastive_loss(pred_latent, tgt_latent, TEMPERATURE)
         loss_L1 = (RECONSTRUCTION_WEIGHT * loss_recon) + (CONTRASTIVE_WEIGHT * loss_contra)
         
@@ -179,12 +212,17 @@ for epoch in range(1, EPOCHS + 1):
         tgt_latent_flat = tgt_latent.reshape(B * SEQ, D)
         labels_batch_flat = labels_batch.reshape(-1, 1).float()  # 修改这里，确保标签维度正确
         
-        # 获取logits
-        logits_L2 = classifier1(pred_latent_flat)
-        logits_L3 = classifier2(tgt_latent_flat)
+        # 计算异常样本的权重
+        anomaly_ratio = labels_batch_flat.mean()
+        pos_weight = torch.tensor([(1 - anomaly_ratio) / (anomaly_ratio + 1e-6)], device=DEVICE)
+        bce_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         
-        # 计算分类损失
+        # L2: 预测latent的分类损失（不更新encoder和predictor）
+        logits_L2 = classifier1(pred_latent_flat.detach())  # 使用detach防止梯度传播到encoder
         loss_L2 = bce_criterion(logits_L2, labels_batch_flat)
+        
+        # L3: 真实latent的分类损失（更新encoder和classifier2）
+        logits_L3 = classifier2(tgt_latent_flat)
         loss_L3 = bce_criterion(logits_L3, labels_batch_flat)
         
         # === 最终总损失 ===
@@ -206,6 +244,7 @@ for epoch in range(1, EPOCHS + 1):
 
     # ------ 验证阶段 ------
     encoder_online.eval()
+    encoder_target.eval()
     predictor.eval()
     classifier1.eval()
     classifier2.eval()
@@ -213,27 +252,30 @@ for epoch in range(1, EPOCHS + 1):
     
     with torch.no_grad():
         for batch in val_loader:
-            if len(batch) == 4:  # 带标签的数据
-                x_batch, y_batch, x_label, y_label = batch
-                labels_batch = y_label  # 使用目标序列的标签
-            else:  # 不带标签的数据
-                x_batch, y_batch = batch
-                labels_batch = torch.zeros(x_batch.size(0), 1, device=DEVICE)  # 默认标签为0
-                
+            x_batch, y_batch, labels_batch = batch
             x_batch, y_batch = x_batch.to(DEVICE), y_batch.to(DEVICE)
             labels_batch = labels_batch.to(DEVICE)
             
+            # 添加N_patch维度，使输入变为4D: (B, N_patch, T, F)
+            x_batch = x_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
+            y_batch = y_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
+            
             ctx_latent = encoder_online(x_batch)
             tgt_latent = encoder_target(y_batch)
-            val_pred_latent, _ = predictor(ctx_latent, tgt_latent)
+            val_pred_latent, val_pred_loss = predictor(ctx_latent, tgt_latent)
             
-            val_loss_L1 = (RECONSTRUCTION_WEIGHT * nn.MSELoss()(val_pred_latent, tgt_latent)) + \
+            val_loss_L1 = (RECONSTRUCTION_WEIGHT * val_pred_loss) + \
                           (CONTRASTIVE_WEIGHT * compute_contrastive_loss(val_pred_latent, tgt_latent, TEMPERATURE))
 
             B, SEQ, D = val_pred_latent.shape
             pred_latent_flat = val_pred_latent.reshape(B * SEQ, D)
             tgt_latent_flat = tgt_latent.reshape(B * SEQ, D)
-            labels_batch_flat = labels_batch.reshape(-1, 1).float()  # 修改这里，确保标签维度正确
+            labels_batch_flat = labels_batch.reshape(-1, 1).float()
+            
+            # 计算验证集的异常样本权重
+            anomaly_ratio = labels_batch_flat.mean()
+            pos_weight = torch.tensor([(1 - anomaly_ratio) / (anomaly_ratio + 1e-6)], device=DEVICE)
+            bce_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
             
             logits_L2 = classifier1(pred_latent_flat)
             logits_L3 = classifier2(tgt_latent_flat)
@@ -267,9 +309,10 @@ for epoch in range(1, EPOCHS + 1):
             'val_loss': best_val_loss,
             'config': {
                 'latent_dim': LATENT_DIM,
-                'patch_length': PATCH_LENGTH,
+                'patch_length': X_PATCH_LENGTH,
                 'num_vars': NUM_VARS,
-                'prediction_length': PREDICTION_LENGTH
+                'prediction_steps': PREDICTION_STEPS,
+                'patch_size': Y_PATCH_SIZE
             }
         }
         print(f"✅ [Epoch {epoch:02d}] New best model found! Total Val Loss: {best_val_loss:.4f}")
