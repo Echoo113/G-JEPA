@@ -37,15 +37,15 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE               = 128
 LATENT_DIM               = 256
 EPOCHS                   = 100
-LEARNING_RATE            = 1e-4
-WEIGHT_DECAY             = 1e-6
+LEARNING_RATE            = 5e-4   
+WEIGHT_DECAY             = 1e-4
 EARLY_STOPPING_PATIENCE  = 15
 EARLY_STOPPING_DELTA     = 1e-5
 
 # --- NEW: 三个损失的权重 ---
 W1 = 1.0  # L1: 自监督损失 (包含recon和contra)
 W2 = 1.0  # L2: 来自pred_latent的分类损失
-W3 = 8.0  # L3: 来自tgt_latent的分类损失
+W3 = 5.0  # L3: 来自tgt_latent的分类损失
 
 # 自监督损失内部权重 (保持不变)
 RECONSTRUCTION_WEIGHT   = 0.1
