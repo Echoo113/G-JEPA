@@ -37,18 +37,18 @@ class StrongClassifier(nn.Module):
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 训练超参数 (保持不变)
-BATCH_SIZE               = 64
+BATCH_SIZE               = 128
 LATENT_DIM               = 128
 EPOCHS                   = 100  # 增加训练轮数
-LEARNING_RATE            = 1e-4  # 降低学习率
+LEARNING_RATE            = 5e-5  # 降低学习率
 WEIGHT_DECAY             = 5e-5  # 降低权重衰减
 EARLY_STOPPING_PATIENCE  = 20    # 增加早停耐心值
 EARLY_STOPPING_DELTA     = 1e-4  # 增加早停阈值
 
 # --- NEW: 三个损失的权重 ---
-W1 = 0.3  # L1: 自监督损失 (包含recon和contra)
-W2 = 0.3  # L2: 来自pred_latent的分类损失
-W3 = 2.5  # L3: 来自tgt_latent的分类损失
+W1 = 1.0  # L1: 自监督损失 (包含recon和contra)
+W2 = 0.8  # L2: 来自pred_latent的分类损失
+W3 = 5.0  # L3: 来自tgt_latent的分类损失
 
 # 自监督损失内部权重 (保持不变)
 RECONSTRUCTION_WEIGHT   = 0.2    # 增加重建损失权重
@@ -244,6 +244,14 @@ for epoch in range(1, EPOCHS + 1):
         total_loss = (W1 * loss_L1) + (W2 * loss_L2) + (W3 * loss_L3)
         
         total_loss.backward()
+        # Add gradient clipping to prevent gradient explosion
+        torch.nn.utils.clip_grad_norm_(
+            list(encoder_online.parameters()) +
+            list(predictor.parameters()) +
+            list(classifier1.parameters()) +
+            list(classifier2.parameters()),
+            max_norm=1.0
+        )
         optimizer.step()
         
         momentum = get_ema_momentum(epoch)
