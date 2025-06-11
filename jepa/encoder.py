@@ -116,7 +116,7 @@ class MyTimeSeriesEncoder(nn.Module):
         """
         B, N, T, F = x.shape
         assert F == self.num_vars, f"Expected {self.num_vars} variables, but got {F}"
-        assert T == self.patch_length, f"Expected patch length {self.patch_length}, but got {T}"
+
 
         # Step 1: 映射每个patch的变量维度
         x = self.var_proj(x)  # (B, N, T, hidden_dim)
