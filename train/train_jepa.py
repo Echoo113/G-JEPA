@@ -34,8 +34,8 @@ class Classifier(nn.Module):
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 训练超参数 (保持不变)
-BATCH_SIZE               = 128
-LATENT_DIM               = 256
+BATCH_SIZE               = 64
+LATENT_DIM               = 128
 EPOCHS                   = 100
 LEARNING_RATE            = 5e-4   
 WEIGHT_DECAY             = 1e-4
@@ -105,8 +105,8 @@ encoder_online = MyTimeSeriesEncoder(
     patch_length=X_PATCH_LENGTH,  # 30步
     num_vars=NUM_VARS,
     latent_dim=LATENT_DIM,
-    time_layers=2,
-    patch_layers=2,
+    time_layers=1,
+    patch_layers=1,
     num_attention_heads=8,
     ffn_dim=LATENT_DIM*4,
     dropout=0.2
@@ -117,8 +117,8 @@ encoder_target = MyTimeSeriesEncoder(
     patch_length=Y_PATCH_SIZE,    # 10步，与predictor的patch_size保持一致
     num_vars=NUM_VARS,
     latent_dim=LATENT_DIM,
-    time_layers=2,
-    patch_layers=2,
+    time_layers=1,
+    patch_layers=1,
     num_attention_heads=8,
     ffn_dim=LATENT_DIM*4,
     dropout=0.2
@@ -134,8 +134,8 @@ predictor = JEPPredictor(
     latent_dim=LATENT_DIM,
     prediction_steps=PREDICTION_STEPS,
     patch_size=Y_PATCH_SIZE,
-    num_layers=3,
-    num_heads=16,
+    num_layers=1,
+    num_heads=8,
     ffn_dim=LATENT_DIM*4,
     dropout=0.2
 ).to(DEVICE)
