@@ -17,15 +17,18 @@ from jepa.encoder import MyTimeSeriesEncoder
 from jepa.predictor import JEPPredictor
 
 # ========= NEW: 定义分类器模型 =========
-class Classifier(nn.Module):
-    """一个简单的MLP分类器，用于判断一个补丁的latent表示是否异常"""
-    def __init__(self, input_dim, hidden_dim=256, output_dim=1):
+class StrongClassifier(nn.Module):
+    """增强版分类器，用于更准确地判断latent表示中的异常"""
+    def __init__(self, input_dim, hidden_dim=256):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.2), # 添加dropout防止过拟合
-            nn.Linear(hidden_dim, output_dim)
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, 1)
         )
     def forward(self, x):
         return self.net(x)
@@ -36,16 +39,16 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # 训练超参数 (保持不变)
 BATCH_SIZE               = 64
 LATENT_DIM               = 128
-EPOCHS                   = 200  # 增加训练轮数
+EPOCHS                   = 100  # 增加训练轮数
 LEARNING_RATE            = 1e-4  # 降低学习率
 WEIGHT_DECAY             = 5e-5  # 降低权重衰减
-EARLY_STOPPING_PATIENCE  = 30    # 增加早停耐心值
+EARLY_STOPPING_PATIENCE  = 20    # 增加早停耐心值
 EARLY_STOPPING_DELTA     = 1e-4  # 增加早停阈值
 
 # --- NEW: 三个损失的权重 ---
-W1 = 0.5  # L1: 自监督损失 (包含recon和contra)
-W2 = 0.5  # L2: 来自pred_latent的分类损失
-W3 = 2.0  # L3: 来自tgt_latent的分类损失
+W1 = 0.3  # L1: 自监督损失 (包含recon和contra)
+W2 = 0.3  # L2: 来自pred_latent的分类损失
+W3 = 2.5  # L3: 来自tgt_latent的分类损失
 
 # 自监督损失内部权重 (保持不变)
 RECONSTRUCTION_WEIGHT   = 0.2    # 增加重建损失权重
@@ -98,6 +101,23 @@ val_loader = get_loader(
     shuffle=False
 )
 
+# --- NEW: 计算全局异常比例 ---
+def compute_global_anomaly_ratio(loader):
+    total_labels = []
+    for _, _, labels in loader:
+        total_labels.append(labels)
+    all_labels = torch.cat(total_labels, dim=0)
+    return all_labels.float().mean().item()
+
+print("\nComputing global anomaly ratio...")
+global_anomaly_ratio = compute_global_anomaly_ratio(train_loader)
+fixed_pos_weight = torch.tensor([(1 - global_anomaly_ratio) / (global_anomaly_ratio + 1e-6)], device=DEVICE)
+print(f"Global anomaly ratio: {global_anomaly_ratio:.4f}")
+print(f"Fixed positive weight: {fixed_pos_weight.item():.4f}")
+
+# 初始化BCE损失函数
+bce_criterion = nn.BCEWithLogitsLoss(pos_weight=fixed_pos_weight)
+
 # ========= Step 2: 初始化模型 (MODIFIED) =========
 print("\n[Step 2] Initializing models...")
 # 1. 编码历史patch的encoder (30步)
@@ -141,8 +161,8 @@ predictor = JEPPredictor(
 ).to(DEVICE)
 
 # 5. 初始化分类器
-classifier1 = Classifier(input_dim=LATENT_DIM).to(DEVICE)
-classifier2 = Classifier(input_dim=LATENT_DIM).to(DEVICE)
+classifier1 = StrongClassifier(input_dim=LATENT_DIM).to(DEVICE)  # 使用增强版分类器
+classifier2 = StrongClassifier(input_dim=LATENT_DIM).to(DEVICE)  # 使用增强版分类器
 
 print(f"Initialized models:")
 print(f"- encoder_online: patch_length={X_PATCH_LENGTH}")
@@ -167,9 +187,6 @@ print("\n[Step 3] Training and validating with hybrid loss...")
 best_val_loss = float('inf')
 patience_counter = 0
 best_state = None
-
-# --- NEW: 定义分类损失函数 ---
-bce_criterion = nn.BCEWithLogitsLoss()
 
 for epoch in range(1, EPOCHS + 1):
     # ------ 训练阶段 ------
@@ -210,13 +227,9 @@ for epoch in range(1, EPOCHS + 1):
         # 将latent和label都拉平，以便每个补丁都能独立计算损失
         pred_latent_flat = pred_latent.reshape(B * SEQ, D)
         tgt_latent_flat = tgt_latent.reshape(B * SEQ, D)
-        labels_batch_flat = labels_batch.reshape(-1, 1).float()  # 修改这里，确保标签维度正确
+        labels_batch_flat = labels_batch.reshape(-1, 1).float()
         
-        # 计算异常样本的权重
-        anomaly_ratio = labels_batch_flat.mean()
-        pos_weight = torch.tensor([(1 - anomaly_ratio) / (anomaly_ratio + 1e-6)], device=DEVICE)
-        bce_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        
+        # 使用固定的pos_weight，不再每个batch重新计算
         # L2: 预测latent的分类损失（不更新encoder和predictor）
         logits_L2 = classifier1(pred_latent_flat.detach())  # 使用detach防止梯度传播到encoder
         loss_L2 = bce_criterion(logits_L2, labels_batch_flat)
@@ -272,11 +285,7 @@ for epoch in range(1, EPOCHS + 1):
             tgt_latent_flat = tgt_latent.reshape(B * SEQ, D)
             labels_batch_flat = labels_batch.reshape(-1, 1).float()
             
-            # 计算验证集的异常样本权重
-            anomaly_ratio = labels_batch_flat.mean()
-            pos_weight = torch.tensor([(1 - anomaly_ratio) / (anomaly_ratio + 1e-6)], device=DEVICE)
-            bce_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-            
+            # 使用固定的pos_weight，不再每个batch重新计算
             logits_L2 = classifier1(pred_latent_flat)
             logits_L3 = classifier2(tgt_latent_flat)
             
