@@ -235,7 +235,9 @@ for epoch in range(1, EPOCHS + 1):
         loss_L2 = bce_criterion(logits_L2, labels_batch_flat)
         
         # L3: 真实latent的分类损失（更新encoder和classifier2）
-        logits_L3 = classifier2(tgt_latent_flat)
+        tgt_latent_for_L3 = encoder_online(y_batch)  # 使用encoder_online编码Y，让L3的梯度可以传播到encoder_online
+        tgt_latent_for_L3_flat = tgt_latent_for_L3.reshape(B * SEQ, D)
+        logits_L3 = classifier2(tgt_latent_for_L3_flat)
         loss_L3 = bce_criterion(logits_L3, labels_batch_flat)
         
         # === 最终总损失 ===
