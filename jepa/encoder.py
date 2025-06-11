@@ -46,7 +46,7 @@ class MyTimeSeriesEncoder(nn.Module):
         self,
         patch_length: int,
         num_vars: int,
-        latent_dim: int = 1024,
+        latent_dim: int,
         time_layers: int = 2,
         patch_layers: int = 3,
         num_attention_heads: int = 16,

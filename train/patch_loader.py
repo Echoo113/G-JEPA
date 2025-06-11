@@ -1,116 +1,45 @@
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
-import os
 
-# ===================================================================
-# ========= 你原有的代码 (保持不变) =========
-# ===================================================================
-
+# ========= PatchDataset =========
 class PatchDataset(Dataset):
     """
-    用于加载【不带标签】的 .npz 文件 (包含 'x_patches', 'y_patches')。
+    用于加载 patch 数据 (x_patches, y_patches, label)，每个 patch 是一个样本
+    输入文件需包含以下字段：
+        - 'x_patches': (N, T_x, F)
+        - 'y_patches': (N, T_y, F)
+        - 'label': (N,)
     """
-    def __init__(self, x_patches: np.ndarray, y_patches: np.ndarray):
-        assert x_patches.shape == y_patches.shape, "x 和 y patch 的维度必须一致"
-        self.x_patches = x_patches
-        self.y_patches = y_patches
+    def __init__(self, npz_file):
+        super().__init__()
+        data = np.load(npz_file)
+
+        self.x = data['x_patches']   # shape: (N, T_x, F)
+        self.y = data['y_patches']   # shape: (N, T_y, F)
+        self.label = data['label']   # shape: (N,)
+
+        assert len(self.x) == len(self.y) == len(self.label), "Patch数据维度不一致"
+        print(f"[Dataset INIT] Loaded {npz_file}")
+        print(f"  ➤ x: {self.x.shape}, y: {self.y.shape}, label: {self.label.shape}")
 
     def __len__(self):
-        return len(self.x_patches)
+        return len(self.x)
 
     def __getitem__(self, idx):
-        x = torch.tensor(self.x_patches[idx], dtype=torch.float)
-        y = torch.tensor(self.y_patches[idx], dtype=torch.float)
-        return x, y
+        x = torch.tensor(self.x[idx], dtype=torch.float32)       # (T_x, F)
+        y = torch.tensor(self.y[idx], dtype=torch.float32)       # (T_y, F)
+        label = torch.tensor(self.label[idx], dtype=torch.float32)  # scalar
+        return x, y, label
 
-def create_patch_loader(npz_path: str, batch_size: int, shuffle: bool = True) -> DataLoader:
-    """
-    创建【不带标签】数据的 DataLoader。
-    """
-    npz = np.load(npz_path)
-    x_patches = npz["x_patches"]
-    y_patches = npz["y_patches"]
-    dataset = PatchDataset(x_patches, y_patches)
+
+# ========= Loader 工具函数 =========
+def get_loader(npz_file, batch_size, shuffle=True):
+    dataset = PatchDataset(npz_file)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+    print(f"[Loader READY] batch_size={batch_size}, total_batches={len(loader)}")
     return loader
 
-# ===================================================================
-# ========= 新增与修改：用于加载带标签数据的 Helper 函数 =========
-# ===================================================================
 
 
-
-class LabeledPatchDataset(Dataset):
-    """
-    用于加载【带标签】的 .npz 文件。
-    支持两种模式：
-    1. 单文件模式：一个 .npz 文件包含 'x_patches', 'y_patches', 'labels'
-    2. 双文件模式：一个 .npz 文件包含特征 ('x_patches', 'y_patches')，另一个包含标签 ('x_labels', 'y_labels')
-    """
-    def __init__(self, feature_data: dict, label_data: dict = None):
-        """
-        Args:
-            feature_data: 包含 'x_patches' 和 'y_patches' 的字典
-            label_data: 包含 'x_labels' 和 'y_labels' 的字典（可选）
-        """
-        self.x_patches = feature_data['x_patches']
-        self.y_patches = feature_data['y_patches']
-        
-        # 处理标签数据
-        if label_data is not None:
-            # 双文件模式
-            self.x_labels = label_data['x_labels']
-            self.y_labels = label_data['y_labels']
-        else:
-            # 单文件模式
-            self.x_labels = feature_data.get('x_labels')
-            self.y_labels = feature_data.get('y_labels')
-        
-        # 验证数据一致性
-        assert len(self.x_patches) == len(self.y_patches), "特征数据长度不匹配"
-        if self.x_labels is not None:
-            assert len(self.x_patches) == len(self.x_labels), "特征和标签长度不匹配"
-            assert len(self.y_patches) == len(self.y_labels), "特征和标签长度不匹配"
-
-    def __len__(self):
-        return len(self.x_patches)
-
-    def __getitem__(self, idx):
-        x = torch.tensor(self.x_patches[idx], dtype=torch.float)
-        y = torch.tensor(self.y_patches[idx], dtype=torch.float)
-        
-        if self.x_labels is not None:
-            x_label = torch.tensor(self.x_labels[idx], dtype=torch.long)
-            y_label = torch.tensor(self.y_labels[idx], dtype=torch.long)
-            return x, y, x_label, y_label
-        return x, y
-
-def create_labeled_loader(
-    feature_npz_path: str,
-    label_npz_path: str = None,
-    batch_size: int = 64,
-    shuffle: bool = True
-) -> DataLoader:
-    """
-    创建【带标签】数据的 DataLoader。
-    
-    Args:
-        feature_npz_path: 特征数据文件路径（包含 'x_patches', 'y_patches'）
-        label_npz_path: 标签数据文件路径（包含 'x_labels', 'y_labels'），如果为None则从特征文件中读取标签
-        batch_size: 批次大小
-        shuffle: 是否打乱数据
-    
-    Returns:
-        DataLoader: 返回 (x, y, x_label, y_label) 或 (x, y) 的 DataLoader
-    """
-    feature_data = np.load(feature_npz_path)
-    
-    if label_npz_path is not None:
-        label_data = np.load(label_npz_path)
-    else:
-        label_data = None
-    
-    dataset = LabeledPatchDataset(feature_data, label_data)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
-    return loader

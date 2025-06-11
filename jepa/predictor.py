@@ -38,30 +38,41 @@ class JEPPredictor(nn.Module):
     Decoder 输出仍然是 latent（不还原到原数据空间）。
     
     输入输出维度：
-    - 输入: (B, N, D) - N个历史patch的latent，每个latent维度为D
-    - 输出: (B, N, D) - N个未来patch的latent预测
+    - 输入: (B, N_ctx, D) - N_ctx个历史patch的latent，每个latent维度为D
+    - 输出: (B, N_tgt, D) - N_tgt个未来patch的latent预测
+    
+    时间步与Patch的关系：
+    - 每个patch包含patch_size个时间步
+    - 实际预测的时间步数 = N_tgt * patch_size
     """
     def __init__(
         self,
         latent_dim: int,              # 与Encoder保持一致
+        prediction_steps: int,        # 要预测的时间步数
+        patch_size: int,         # 每个patch包含的时间步数
         num_layers: int = 3,          # Transformer层数
         num_heads: int = 16,          # 注意力头数
         ffn_dim: int = None,
         dropout: float = 0.2,
-        prediction_length: int = 9     # 预测的patch数量
     ):
         """
         Args:
             latent_dim:        Encoder 输出的 latent 维度 D
-            num_layers:        Transformer Encoder/Decoder 层数
+            prediction_steps:  要预测的时间步数
+            patch_size:       每个patch包含的时间步数
+            num_layers:       Transformer Encoder/Decoder 层数
             num_heads:        注意力头数
             ffn_dim:         Feed‐forward 网络维度，默认 4 * latent_dim
             dropout:         dropout 比例
-            prediction_length: 预测的 patch 数 N_tgt
         """
         super().__init__()
         self.latent_dim = latent_dim
-        self.pred_len = prediction_length
+        self.patch_size = patch_size
+        self.prediction_steps = prediction_steps
+        
+        # 计算需要的patch数量（向上取整以确保覆盖所有时间步）
+        self.pred_len = math.ceil(prediction_steps / patch_size)
+        self.total_pred_steps = self.pred_len * patch_size
 
         if ffn_dim is None:
             ffn_dim = latent_dim * 4
@@ -107,14 +118,14 @@ class JEPPredictor(nn.Module):
         前向传播
 
         Args:
-            ctx_latents: (B, N, D) - N个历史patch的latent
-            tgt_latents: (B, N, D) - N个未来patch的latent，训练时需要
+            ctx_latents: (B, N_ctx, D) - N_ctx个历史patch的latent
+            tgt_latents: (B, N_tgt, D) - N_tgt个未来patch的latent，训练时需要
         Returns:
             如果 tgt_latents 不为 None（训练）：
-                pred_latents:  (B, N, D)
+                pred_latents:  (B, N_tgt, D)
                 loss:          MSELoss(pred_latents, tgt_latents)
             如果 tgt_latents 为 None（推理）：
-                pred_latents: (B, N, D)
+                pred_latents: (B, N_tgt, D)
                 loss: None
         """
         device = ctx_latents.device
@@ -156,7 +167,6 @@ class JEPPredictor(nn.Module):
 
         else:
             # —— 推理模式：自回归生成 N 个 latent
-            assert self.pred_len is not None, "推理时必须提供 prediction_length"
             N_tgt = self.pred_len
 
             preds = []

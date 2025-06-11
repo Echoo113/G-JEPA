@@ -40,3 +40,16 @@ print(f"Anomaly ratio in test_labels: {np.sum(test_labels)/len(test_labels)}")
 print(f"True label ratio in test_labels: {np.sum(test_labels)/len(test_labels)}")
 #print first true label index in test_labels
 print(f"First true label index in test_labels: {np.where(test_labels == 1)[0][0]}")
+
+y = test_labels  # shape = [time], True/False
+
+# 先转为 0/1
+y = y.astype(int)
+
+# 遍历每个维度，计算异常时间点的值变化程度
+anomaly_indices = np.where(y == 1)[0]
+
+for i in range(test_data.shape[1]):
+    vals = test_data[:, i]
+    std_during_anomaly = np.std(vals[anomaly_indices])
+    print(f"Var {i}: std = {std_during_anomaly:.4f}")

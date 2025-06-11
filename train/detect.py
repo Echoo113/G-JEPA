@@ -18,7 +18,7 @@ from jepa.predictor import JEPPredictor
 
 # ========== 分类器结构 ==========
 class Classifier(nn.Module):
-    def __init__(self, input_dim, hidden_dim=256, output_dim=1):
+    def __init__(self, input_dim, hidden_dim=512, output_dim=1):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
