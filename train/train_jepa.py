@@ -106,8 +106,8 @@ encoder_online = MyTimeSeriesEncoder(
     num_vars=NUM_VARS,
     latent_dim=LATENT_DIM,
     time_layers=2,
-    patch_layers=3,
-    num_attention_heads=16,
+    patch_layers=2,
+    num_attention_heads=8,
     ffn_dim=LATENT_DIM*4,
     dropout=0.2
 ).to(DEVICE)
@@ -118,8 +118,8 @@ encoder_target = MyTimeSeriesEncoder(
     num_vars=NUM_VARS,
     latent_dim=LATENT_DIM,
     time_layers=2,
-    patch_layers=3,
-    num_attention_heads=16,
+    patch_layers=2,
+    num_attention_heads=8,
     ffn_dim=LATENT_DIM*4,
     dropout=0.2
 ).to(DEVICE)
