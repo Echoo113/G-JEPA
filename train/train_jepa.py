@@ -36,21 +36,21 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # 训练超参数 (保持不变)
 BATCH_SIZE               = 64
 LATENT_DIM               = 128
-EPOCHS                   = 100
-LEARNING_RATE            = 5e-4   
-WEIGHT_DECAY             = 1e-4
-EARLY_STOPPING_PATIENCE  = 15
-EARLY_STOPPING_DELTA     = 1e-5
+EPOCHS                   = 200  # 增加训练轮数
+LEARNING_RATE            = 1e-4  # 降低学习率
+WEIGHT_DECAY             = 5e-5  # 降低权重衰减
+EARLY_STOPPING_PATIENCE  = 30    # 增加早停耐心值
+EARLY_STOPPING_DELTA     = 1e-4  # 增加早停阈值
 
 # --- NEW: 三个损失的权重 ---
-W1 = 1.0  # L1: 自监督损失 (包含recon和contra)
-W2 = 1.0  # L2: 来自pred_latent的分类损失
-W3 = 5.0  # L3: 来自tgt_latent的分类损失
+W1 = 0.5  # L1: 自监督损失 (包含recon和contra)
+W2 = 0.5  # L2: 来自pred_latent的分类损失
+W3 = 2.0  # L3: 来自tgt_latent的分类损失
 
 # 自监督损失内部权重 (保持不变)
-RECONSTRUCTION_WEIGHT   = 0.1
-CONTRASTIVE_WEIGHT      = 1.0
-TEMPERATURE             = 0.05
+RECONSTRUCTION_WEIGHT   = 0.2    # 增加重建损失权重
+CONTRASTIVE_WEIGHT      = 0.8    # 降低对比损失权重
+TEMPERATURE             = 0.1    # 增加温度参数
 
 # EMA 相关参数 (保持不变)
 EMA_MOMENTUM            = 0.99
@@ -105,11 +105,11 @@ encoder_online = MyTimeSeriesEncoder(
     patch_length=X_PATCH_LENGTH,  # 30步
     num_vars=NUM_VARS,
     latent_dim=LATENT_DIM,
-    time_layers=1,
-    patch_layers=1,
+    time_layers=2,    # 增加时间层数
+    patch_layers=2,   # 增加patch层数
     num_attention_heads=8,
     ffn_dim=LATENT_DIM*4,
-    dropout=0.2
+    dropout=0.3       # 增加dropout
 ).to(DEVICE)
 
 # 2. 编码未来patch的encoder (10步)
@@ -117,11 +117,11 @@ encoder_target = MyTimeSeriesEncoder(
     patch_length=Y_PATCH_SIZE,    # 10步，与predictor的patch_size保持一致
     num_vars=NUM_VARS,
     latent_dim=LATENT_DIM,
-    time_layers=1,
-    patch_layers=1,
+    time_layers=2,    # 增加时间层数
+    patch_layers=2,   # 增加patch层数
     num_attention_heads=8,
     ffn_dim=LATENT_DIM*4,
-    dropout=0.2
+    dropout=0.3       # 增加dropout
 ).to(DEVICE)
 
 # 3. 初始化target encoder的参数（使用online encoder的参数）
@@ -134,10 +134,10 @@ predictor = JEPPredictor(
     latent_dim=LATENT_DIM,
     prediction_steps=PREDICTION_STEPS,
     patch_size=Y_PATCH_SIZE,
-    num_layers=1,
+    num_layers=2,     # 增加层数
     num_heads=8,
     ffn_dim=LATENT_DIM*4,
-    dropout=0.2
+    dropout=0.3       # 增加dropout
 ).to(DEVICE)
 
 # 5. 初始化分类器
