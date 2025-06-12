@@ -33,6 +33,21 @@ class StrongClassifier(nn.Module):
     def forward(self, x):
         return self.net(x)
 
+# ========= NEW: Instance Normalization =========
+USE_INSTANCE_NORM = True  # 控制是否使用Instance Normalization
+
+def apply_instance_norm(x, eps=1e-5):
+    """
+    对输入 x 做 Instance Normalization
+    输入:
+        x: Tensor, shape (B, 1, T, F) —— 一个 batch 的 patch 序列
+    输出:
+        normalized x, shape 相同
+    """
+    mean = x.mean(dim=2, keepdim=True)  # 沿时间维度求均值
+    std = x.std(dim=2, keepdim=True)
+    return (x - mean) / (std + eps)
+
 # ========= 全局设置 (MODIFIED) =========
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -51,8 +66,8 @@ W2 = 0.8  # L2: 来自pred_latent的分类损失
 W3 = 5.0  # L3: 来自tgt_latent的分类损失
 
 # 自监督损失内部权重 (保持不变)
-RECONSTRUCTION_WEIGHT   = 0.2    # 增加重建损失权重
-CONTRASTIVE_WEIGHT      = 0.8    # 降低对比损失权重
+RECONSTRUCTION_WEIGHT   = 0.5    # 增加重建损失权重
+CONTRASTIVE_WEIGHT      = 0.5    # 降低对比损失权重
 TEMPERATURE             = 0.1    # 增加温度参数
 
 # EMA 相关参数 (保持不变)
@@ -206,7 +221,11 @@ for epoch in range(1, EPOCHS + 1):
         # 添加N_patch维度，使输入变为4D: (B, N_patch, T, F)
         x_batch = x_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
         y_batch = y_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
-       
+        
+        # === 添加 Instance Normalization ===
+        if USE_INSTANCE_NORM:
+            x_batch = apply_instance_norm(x_batch)
+            y_batch = apply_instance_norm(y_batch)
         
         optimizer.zero_grad()
         
@@ -230,8 +249,8 @@ for epoch in range(1, EPOCHS + 1):
         labels_batch_flat = labels_batch.reshape(-1, 1).float()
         
         # 使用固定的pos_weight，不再每个batch重新计算
-        # L2: 预测latent的分类损失（不更新encoder和predictor）
-        logits_L2 = classifier1(pred_latent_flat.detach())  # 使用detach防止梯度传播到encoder
+        # L2: 预测latent的分类损失（更新encoder和predictor）
+        logits_L2 = classifier1(pred_latent_flat)
         loss_L2 = bce_criterion(logits_L2, labels_batch_flat)
         
         # L3: 真实latent的分类损失（更新encoder和classifier2）
@@ -282,6 +301,11 @@ for epoch in range(1, EPOCHS + 1):
             # 添加N_patch维度，使输入变为4D: (B, N_patch, T, F)
             x_batch = x_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
             y_batch = y_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
+            
+            # === 添加 Instance Normalization ===
+            if USE_INSTANCE_NORM:
+                x_batch = apply_instance_norm(x_batch)
+                y_batch = apply_instance_norm(y_batch)
             
             ctx_latent = encoder_online(x_batch)
             tgt_latent = encoder_target(y_batch)
