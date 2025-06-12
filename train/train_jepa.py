@@ -24,9 +24,10 @@ class StrongClassifier(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.4),  # 增加dropout
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
+            nn.Dropout(0.4),  # 增加dropout
             nn.Linear(hidden_dim // 2, 1)
         )
     def forward(self, x):
@@ -54,19 +55,19 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE               = 256
 LATENT_DIM               = 128
 EPOCHS                   = 100  # 增加训练轮数
-LEARNING_RATE            = 1e-4  # 提高学习率
-WEIGHT_DECAY             = 5e-5  # 降低权重衰减
+LEARNING_RATE            = 2e-5  # 降低学习率以减缓过拟合
+WEIGHT_DECAY             = 1e-4  # 增加权重衰减以增强正则化
 EARLY_STOPPING_PATIENCE  = 20    # 增加早停耐心值
 EARLY_STOPPING_DELTA     = 1e-4  # 增加早停阈值
 
 # --- NEW: 三个损失的权重 ---
 W1 = 1.0  # L1: 自监督损失 (包含recon和contra)
-W2 = 1.0  # L2: 来自pred_latent的分类损失
-W3 = 1.0  # L3: 来自tgt_latent的分类损失
+W2 = 0.5  # L2: 来自pred_latent的分类损失，降低权重
+W3 = 0.5  # L3: 来自tgt_latent的分类损失，降低权重
 
 # 自监督损失内部权重 (保持不变)
 RECONSTRUCTION_WEIGHT   = 1.0    # 增加重建损失权重
-CONTRASTIVE_WEIGHT      = 0.0    # 完全关闭对比损失
+CONTRASTIVE_WEIGHT      = 0.1    # 重新启用对比损失，但使用较小的权重
 TEMPERATURE             = 0.1    # 增加温度参数
 
 # EMA 相关参数 (保持不变)
@@ -143,7 +144,7 @@ encoder_online = MyTimeSeriesEncoder(
     patch_layers=2,   # 增加patch层数
     num_attention_heads=8,
     ffn_dim=LATENT_DIM*4,
-    dropout=0.3       # 增加dropout
+    dropout=0.4       # 增加dropout以增强正则化
 ).to(DEVICE)
 
 # 2. 编码未来patch的encoder (10步)
@@ -155,7 +156,7 @@ encoder_target = MyTimeSeriesEncoder(
     patch_layers=2,   # 增加patch层数
     num_attention_heads=8,
     ffn_dim=LATENT_DIM*4,
-    dropout=0.3       # 增加dropout
+    dropout=0.4       # 增加dropout以增强正则化
 ).to(DEVICE)
 
 # 3. 初始化target encoder的参数（使用online encoder的参数）
@@ -171,7 +172,7 @@ predictor = JEPPredictor(
     num_layers=2,     # 增加层数
     num_heads=8,
     ffn_dim=LATENT_DIM*4,
-    dropout=0.3       # 增加dropout
+    dropout=0.4       # 增加dropout以增强正则化
 ).to(DEVICE)
 
 # 5. 初始化分类器
@@ -245,18 +246,19 @@ for epoch in range(1, EPOCHS + 1):
         # 将latent和label都拉平，以便每个补丁都能独立计算损失
         pred_latent_flat = pred_latent.reshape(B * SEQ, D)
         tgt_latent_flat = tgt_latent.reshape(B * SEQ, D)
-        labels_batch_flat = labels_batch.reshape(-1, 1).float()
+        # 修复标签维度：将标签扩展到每个patch
+        labels_batch_expanded = labels_batch.view(-1, 1).repeat(1, SEQ).view(-1, 1).float()
         
         # 使用固定的pos_weight，不再每个batch重新计算
         # L2: 预测latent的分类损失（更新encoder和predictor）
         logits_L2 = classifier1(pred_latent_flat)
-        loss_L2 = bce_criterion(logits_L2, labels_batch_flat)
+        loss_L2 = bce_criterion(logits_L2, labels_batch_expanded)
         
         # L3: 真实latent的分类损失（更新encoder和classifier2）
         tgt_latent_for_L3 = encoder_online(y_batch)  # 使用encoder_online编码Y，让L3的梯度可以传播到encoder_online
         tgt_latent_for_L3_flat = tgt_latent_for_L3.reshape(B * SEQ, D)
         logits_L3 = classifier2(tgt_latent_for_L3_flat)
-        loss_L3 = bce_criterion(logits_L3, labels_batch_flat)
+        loss_L3 = bce_criterion(logits_L3, labels_batch_expanded)
         
         # === 最终总损失 ===
         total_loss = (W1 * loss_L1) + (W2 * loss_L2) + (W3 * loss_L3)
@@ -316,14 +318,14 @@ for epoch in range(1, EPOCHS + 1):
             B, SEQ, D = val_pred_latent.shape
             pred_latent_flat = val_pred_latent.reshape(B * SEQ, D)
             tgt_latent_flat = tgt_latent.reshape(B * SEQ, D)
-            labels_batch_flat = labels_batch.reshape(-1, 1).float()
+            labels_batch_expanded = labels_batch.view(-1, 1).repeat(1, SEQ).view(-1, 1).float()
             
             # 使用固定的pos_weight，不再每个batch重新计算
             logits_L2 = classifier1(pred_latent_flat)
             logits_L3 = classifier2(tgt_latent_flat)
             
-            val_loss_L2 = bce_criterion(logits_L2, labels_batch_flat)
-            val_loss_L3 = bce_criterion(logits_L3, labels_batch_flat)
+            val_loss_L2 = bce_criterion(logits_L2, labels_batch_expanded)
+            val_loss_L3 = bce_criterion(logits_L3, labels_batch_expanded)
             
             total_val_L1 += val_loss_L1.item()
             total_val_L2 += val_loss_L2.item()
