@@ -117,7 +117,6 @@ class MyTimeSeriesEncoder(nn.Module):
         B, N, T, F = x.shape
         assert F == self.num_vars, f"Expected {self.num_vars} variables, but got {F}"
 
-
         # Step 1: 映射每个patch的变量维度
         x = self.var_proj(x)  # (B, N, T, hidden_dim)
 
@@ -139,9 +138,5 @@ class MyTimeSeriesEncoder(nn.Module):
         patch_latent = self.cls_to_latent(patch_cls)  # (B*N, latent_dim)
         patch_latent = patch_latent.view(B, N, self.latent_dim)  # (B, N, latent_dim)
 
-        # Step 7: patch级编码（用于多个patch堆叠时建模）
-        patch_latent = self.patch_pos_encoder(patch_latent)
-        patch_latent = self.patch_encoder(patch_latent)
-
-        # Step 8: 最后归一化
+        # 删除patch级编码，直接返回第一阶段的结果
         return self.norm(patch_latent)
