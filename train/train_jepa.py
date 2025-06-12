@@ -18,12 +18,11 @@ from jepa.predictor import JEPPredictor
 
 # ========= NEW: 定义分类器模型 =========
 class StrongClassifier(nn.Module):
-    """增强版分类器，用于更准确地判断latent表示中的异常"""
+    """简化版分类器，移除BatchNorm以提高稳定性"""
     def __init__(self, input_dim, hidden_dim=256):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(hidden_dim, hidden_dim // 2),
@@ -33,19 +32,19 @@ class StrongClassifier(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-# ========= NEW: Instance Normalization =========
-USE_INSTANCE_NORM = True  # 控制是否使用Instance Normalization
+# ========= NEW: Batch-Level Normalization =========
+USE_BATCH_NORM = True  # 控制是否使用Batch-Level Normalization
 
-def apply_instance_norm(x, eps=1e-5):
+def apply_batch_time_norm(x, eps=1e-5):
     """
-    对输入 x 做 Instance Normalization
+    对输入 x 做 Batch-Level Normalization
     输入:
         x: Tensor, shape (B, 1, T, F) —— 一个 batch 的 patch 序列
     输出:
         normalized x, shape 相同
     """
-    mean = x.mean(dim=2, keepdim=True)  # 沿时间维度求均值
-    std = x.std(dim=2, keepdim=True)
+    mean = x.mean(dim=(0,2), keepdim=True)  # 在batch和时间维度上求均值
+    std = x.std(dim=(0,2), keepdim=True)
     return (x - mean) / (std + eps)
 
 # ========= 全局设置 (MODIFIED) =========
@@ -55,7 +54,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE               = 256
 LATENT_DIM               = 128
 EPOCHS                   = 100  # 增加训练轮数
-LEARNING_RATE            = 5e-5  # 降低学习率
+LEARNING_RATE            = 1e-4  # 提高学习率
 WEIGHT_DECAY             = 5e-5  # 降低权重衰减
 EARLY_STOPPING_PATIENCE  = 20    # 增加早停耐心值
 EARLY_STOPPING_DELTA     = 1e-4  # 增加早停阈值
@@ -63,16 +62,16 @@ EARLY_STOPPING_DELTA     = 1e-4  # 增加早停阈值
 # --- NEW: 三个损失的权重 ---
 W1 = 1.0  # L1: 自监督损失 (包含recon和contra)
 W2 = 1.0  # L2: 来自pred_latent的分类损失
-W3 = 2.0  # L3: 来自tgt_latent的分类损失
+W3 = 1.0  # L3: 来自tgt_latent的分类损失
 
 # 自监督损失内部权重 (保持不变)
-RECONSTRUCTION_WEIGHT   = 0.6    # 增加重建损失权重
-CONTRASTIVE_WEIGHT      = 0.4    # 降低对比损失权重
+RECONSTRUCTION_WEIGHT   = 1.0    # 增加重建损失权重
+CONTRASTIVE_WEIGHT      = 0.0    # 完全关闭对比损失
 TEMPERATURE             = 0.1    # 增加温度参数
 
 # EMA 相关参数 (保持不变)
-EMA_MOMENTUM            = 0.99
-EMA_WARMUP_EPOCHS       = 10
+EMA_MOMENTUM            = 0.95   # 降低EMA动量以加快收敛
+EMA_WARMUP_EPOCHS       = 5      # 减少预热轮数
 EMA_WARMUP_MOMENTUM     = 0.95
 
 # 数据集配置 (保持不变)
@@ -222,10 +221,10 @@ for epoch in range(1, EPOCHS + 1):
         x_batch = x_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
         y_batch = y_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
         
-        # === 添加 Instance Normalization ===
-        if USE_INSTANCE_NORM:
-            x_batch = apply_instance_norm(x_batch)
-            y_batch = apply_instance_norm(y_batch)
+        # === 添加 Batch-Level Normalization ===
+        if USE_BATCH_NORM:
+            x_batch = apply_batch_time_norm(x_batch)
+            y_batch = apply_batch_time_norm(y_batch)
         
         optimizer.zero_grad()
         
@@ -302,10 +301,10 @@ for epoch in range(1, EPOCHS + 1):
             x_batch = x_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
             y_batch = y_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
             
-            # === 添加 Instance Normalization ===
-            if USE_INSTANCE_NORM:
-                x_batch = apply_instance_norm(x_batch)
-                y_batch = apply_instance_norm(y_batch)
+            # === 添加 Batch-Level Normalization ===
+            if USE_BATCH_NORM:
+                x_batch = apply_batch_time_norm(x_batch)
+                y_batch = apply_batch_time_norm(y_batch)
             
             ctx_latent = encoder_online(x_batch)
             tgt_latent = encoder_target(y_batch)

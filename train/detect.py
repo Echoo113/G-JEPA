@@ -22,18 +22,18 @@ MODEL_PATH = "model/jepa_best.pt"  # 预训练的Encoder模型路径
 TRAIN_FEATURE_PATH = "data/MSL/patches/train.npz"
 TEST_FEATURE_PATH = "data/MSL/patches/test.npz"
 BATCH_SIZE = 256  # 可以适当调大以加快特征提取速度
-USE_INSTANCE_NORM = True  # 控制是否使用时间维度归一化
+USE_BATCH_NORM = True  # 控制是否使用Batch-Level Normalization
 
-def apply_time_norm(x, eps=1e-5):
+def apply_batch_time_norm(x, eps=1e-5):
     """
-    对单变量输入 (B, 1, T, 1) 沿时间维度进行归一化
+    对输入 x 做 Batch-Level Normalization
     输入:
-        x: Tensor, shape (B, 1, T, 1) —— 一个 batch 的 patch 序列
+        x: Tensor, shape (B, 1, T, F) —— 一个 batch 的 patch 序列
     输出:
         normalized x, shape 相同
     """
-    mean = x.mean(dim=2, keepdim=True)  # 沿时间维度
-    std = x.std(dim=2, keepdim=True)
+    mean = x.mean(dim=(0,2), keepdim=True)  # 在batch和时间维度上求均值
+    std = x.std(dim=(0,2), keepdim=True)
     return (x - mean) / (std + eps)
 
 @torch.no_grad()
@@ -49,9 +49,9 @@ def extract_embeddings(encoder, data_loader, description):
         # unsqueeze(1) 添加一个维度以匹配模型输入 (B, N_patch, T, F)
         x_batch = x_batch.to(DEVICE).unsqueeze(1)
         
-        # === 添加时间维度归一化 ===
-        if USE_INSTANCE_NORM:
-            x_batch = apply_time_norm(x_batch)
+        # === 添加 Batch-Level Normalization ===
+        if USE_BATCH_NORM:
+            x_batch = apply_batch_time_norm(x_batch)
         
         latent = encoder(x_batch)
         B, SEQ, D = latent.shape
