@@ -33,19 +33,19 @@ class StrongClassifier(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-# ========= NEW: Batch-Level Normalization =========
-USE_BATCH_NORM = True  # 控制是否使用Batch-Level Normalization
 
-def apply_batch_time_norm(x, eps=1e-5):
+
+def apply_instance_norm(x, eps=1e-5):
     """
-    对输入 x 做 Batch-Level Normalization
+    对输入 x 的每个实例独立进行归一化
     输入:
-        x: Tensor, shape (B, 1, T, F) —— 一个 batch 的 patch 序列
+        x: Tensor, shape (B, 1, T, F)
     输出:
         normalized x, shape 相同
     """
-    mean = x.mean(dim=(0,2), keepdim=True)  # 在batch和时间维度上求均值
-    std = x.std(dim=(0,2), keepdim=True)
+    # 保持Batch维度(B)和通道维度(1)独立，只在时间和特征维度上计算
+    mean = x.mean(dim=(2, 3), keepdim=True)
+    std = x.std(dim=(2, 3), keepdim=True)
     return (x - mean) / (std + eps)
 
 # ========= 全局设置 (MODIFIED) =========
@@ -62,8 +62,8 @@ EARLY_STOPPING_DELTA     = 1e-4  # 增加早停阈值
 
 # --- NEW: 三个损失的权重 ---
 W1 = 1.0  # L1: 自监督损失 (包含recon和contra)
-W2 = 0.5  # L2: 来自pred_latent的分类损失，降低权重
-W3 = 0.5  # L3: 来自tgt_latent的分类损失，降低权重
+W2 = 1.0  # L2: 来自pred_latent的分类损失，降低权重
+W3 = 1.0  # L3: 暂时禁用L3损失，简化训练目标
 
 # 自监督损失内部权重 (保持不变)
 RECONSTRUCTION_WEIGHT   = 1.0    # 增加重建损失权重
@@ -222,10 +222,9 @@ for epoch in range(1, EPOCHS + 1):
         x_batch = x_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
         y_batch = y_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
         
-        # === 添加 Batch-Level Normalization ===
-        if USE_BATCH_NORM:
-            x_batch = apply_batch_time_norm(x_batch)
-            y_batch = apply_batch_time_norm(y_batch)
+        # === 使用实例归一化 ===
+        x_batch = apply_instance_norm(x_batch)
+        y_batch = apply_instance_norm(y_batch)
         
         optimizer.zero_grad()
         
@@ -303,10 +302,9 @@ for epoch in range(1, EPOCHS + 1):
             x_batch = x_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
             y_batch = y_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
             
-            # === 添加 Batch-Level Normalization ===
-            if USE_BATCH_NORM:
-                x_batch = apply_batch_time_norm(x_batch)
-                y_batch = apply_batch_time_norm(y_batch)
+            # === 使用实例归一化 ===
+            x_batch = apply_instance_norm(x_batch)
+            y_batch = apply_instance_norm(y_batch)
             
             ctx_latent = encoder_online(x_batch)
             tgt_latent = encoder_target(y_batch)
