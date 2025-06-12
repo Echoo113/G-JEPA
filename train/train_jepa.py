@@ -52,7 +52,7 @@ def apply_instance_norm(x, eps=1e-5):
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 训练超参数 (保持不变)
-BATCH_SIZE               = 128
+BATCH_SIZE               = 256
 LATENT_DIM               = 128
 EPOCHS                   = 100  # 增加训练轮数
 LEARNING_RATE            = 5e-5  # 降低学习率
@@ -62,12 +62,12 @@ EARLY_STOPPING_DELTA     = 1e-4  # 增加早停阈值
 
 # --- NEW: 三个损失的权重 ---
 W1 = 1.0  # L1: 自监督损失 (包含recon和contra)
-W2 = 0.8  # L2: 来自pred_latent的分类损失
-W3 = 5.0  # L3: 来自tgt_latent的分类损失
+W2 = 1.0  # L2: 来自pred_latent的分类损失
+W3 = 2.0  # L3: 来自tgt_latent的分类损失
 
 # 自监督损失内部权重 (保持不变)
-RECONSTRUCTION_WEIGHT   = 0.5    # 增加重建损失权重
-CONTRASTIVE_WEIGHT      = 0.5    # 降低对比损失权重
+RECONSTRUCTION_WEIGHT   = 0.6    # 增加重建损失权重
+CONTRASTIVE_WEIGHT      = 0.4    # 降低对比损失权重
 TEMPERATURE             = 0.1    # 增加温度参数
 
 # EMA 相关参数 (保持不变)
