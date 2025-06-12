@@ -62,11 +62,11 @@ EARLY_STOPPING_DELTA     = 1e-4  # 增加早停阈值
 
 # --- NEW: 三个损失的权重 ---
 W1 = 1.0  # L1: 自监督损失 (包含recon和contra)
-W2 = 1.0  # L2: 来自pred_latent的分类损失，降低权重
-W3 = 1.0  # L3: 暂时禁用L3损失，简化训练目标
+W2 = 5.0  # L2: 来自pred_latent的分类损失，降低权重
+W3 = 5.0  # L3: 暂时禁用L3损失，简化训练目标
 
 # 自监督损失内部权重 (保持不变)
-RECONSTRUCTION_WEIGHT   = 1.0    # 增加重建损失权重
+RECONSTRUCTION_WEIGHT   = 0.9    # 增加重建损失权重
 CONTRASTIVE_WEIGHT      = 0.1    # 重新启用对比损失，但使用较小的权重
 TEMPERATURE             = 0.1    # 增加温度参数
 
