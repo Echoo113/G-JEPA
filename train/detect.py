@@ -1,139 +1,206 @@
-import os
 import sys
+import os
 import torch
-import numpy as np
+import torch.nn as nn
 from torch.utils.data import DataLoader
-from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix
-from sklearn.ensemble import IsolationForest # 核心模型
+import numpy as np
+from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
 
-# --- 加入项目路径 ---
-# 确保可以正确导入自定义模块
+# 假设您的自定义模块在项目的根目录下
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-# --- 导入自定义模块 ---
-from patch_loader import get_loader
+# 确保可以找到之前的模块
 from jepa.encoder import MyTimeSeriesEncoder
+from patch_loader import get_loader
 
-# ========== 配置 ==========
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_PATH = "model/jepa_best.pt"  # 预训练的Encoder模型路径
-TRAIN_FEATURE_PATH = "data/MSL/patches/train.npz"
-TEST_FEATURE_PATH = "data/MSL/patches/test.npz"
-BATCH_SIZE = 256  # 可以适当调大以加快特征提取速度
-USE_BATCH_NORM = True  # 控制是否使用Batch-Level Normalization
+# =============================================================================
+#  组件定义: 严格使用与您训练脚本中相同的组件
+# =============================================================================
 
-def apply_batch_time_norm(x, eps=1e-5):
-    """
-    对输入 x 做 Batch-Level Normalization
-    输入:
-        x: Tensor, shape (B, 1, T, F) —— 一个 batch 的 patch 序列
-    输出:
-        normalized x, shape 相同
-    """
-    mean = x.mean(dim=(0,2), keepdim=True)  # 在batch和时间维度上求均值
-    std = x.std(dim=(0,2), keepdim=True)
+class StrongClassifier(nn.Module):
+    """用于下游任务的分类器"""
+    def __init__(self, input_dim, hidden_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.4),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+def apply_instance_norm(x, eps=1e-5):
+    """对输入 x 的每个实例独立进行归一化，与预训练时完全一致"""
+    mean = x.mean(dim=(2, 3), keepdim=True)
+    std = x.std(dim=(2, 3), keepdim=True)
     return (x - mean) / (std + eps)
 
-@torch.no_grad()
-def extract_embeddings(encoder, data_loader, description):
-    """使用encoder提取指定数据集的潜在表示"""
-    print(f"\n正在提取 {description} 的特征...")
-    encoder.eval()
-    
-    all_embeddings = []
-    all_labels = []
-
-    for x_batch, _, labels_batch in data_loader:
-        # unsqueeze(1) 添加一个维度以匹配模型输入 (B, N_patch, T, F)
-        x_batch = x_batch.to(DEVICE).unsqueeze(1)
-        
-        # === 添加 Batch-Level Normalization ===
-        if USE_BATCH_NORM:
-            x_batch = apply_batch_time_norm(x_batch)
-        
-        latent = encoder(x_batch)
-        B, SEQ, D = latent.shape
-        latent_flat = latent.reshape(B * SEQ, D)
-        labels_flat = labels_batch.reshape(-1, 1)
-
-        all_embeddings.append(latent_flat.cpu().numpy())
-        all_labels.append(labels_flat.cpu().numpy())
-
-    all_embeddings = np.concatenate(all_embeddings, axis=0)
-    all_labels = np.concatenate(all_labels, axis=0)
-    print(f"{description} 特征提取完成，共 {len(all_embeddings)} 个样本。")
-    return all_embeddings, all_labels
-
-def main():
-    # ========== 1. 加载预训练的Encoder ==========
-    print("🚀 开始Encoder + Isolation Forest异常检测流程")
-    print("\n[1/4] 正在加载预训练的Encoder模型...")
-    
-    try:
-        checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
-    except FileNotFoundError:
-        print(f"❌错误: 模型文件未找到于 '{MODEL_PATH}'。请确保路径正确。")
-        return
-
-    config = checkpoint.get("config")
-    if config is None:
-        print("❌错误: 检查点文件中缺少 'config' 字典。")
-        return
-        
-    encoder_config = {
-        'patch_length': config['patch_length'], 'num_vars': config['num_vars'], 'latent_dim': config['latent_dim'],
-        'time_layers': 2, 'patch_layers': 2, 'num_attention_heads': 8, 'ffn_dim': config['latent_dim'] * 4, 'dropout': 0.3
+# ========= 1. 全局和下游任务设置 =========
+def setup_config():
+    """集中管理所有配置"""
+    config = {
+        "DEVICE": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        "PRETRAINED_MODEL_PATH": "model/jepa_final.pt",
+        "DATA_PATH_PREFIX": "data/TSB-AD-U/patches/", # 请根据您的数据集路径修改
+        "DOWNSTREAM_EPOCHS": 50,
+        "DOWNSTREAM_LR": 1e-3,
+        "DOWNSTREAM_BATCH_SIZE": 512,
+        "LATENT_DIM": 128,
+        "X_PATCH_LENGTH": 30,
+        "NUM_VARS": 1,
     }
+    return config
 
-    encoder = MyTimeSeriesEncoder(**encoder_config).to(DEVICE)
-    encoder.load_state_dict(checkpoint["encoder_online_state_dict"])
-    print("✅ Encoder加载成功。")
+# ========= 2. 主执行函数 =========
+def main():
+    """主执行逻辑"""
+    cfg = setup_config()
+    print("🚀 [Step 1] Configuration loaded.")
+    print(f"Using device: {cfg['DEVICE']}")
 
-    # ========== 2. 加载数据集并提取特征 ==========
-    print("\n[2/4] 正在加载数据集并提取特征...")
-    train_loader = get_loader(npz_file=TRAIN_FEATURE_PATH, batch_size=BATCH_SIZE, shuffle=False)
-    test_loader = get_loader(npz_file=TEST_FEATURE_PATH, batch_size=BATCH_SIZE, shuffle=False)
+    # --- 加载数据集 ---
+    print("\n📦 [Step 2] Loading datasets for downstream task...")
+    try:
+        # 使用验证集训练分类器
+        train_classifier_loader = get_loader(
+            npz_file=os.path.join(cfg["DATA_PATH_PREFIX"], "val.npz"),
+            batch_size=cfg["DOWNSTREAM_BATCH_SIZE"],
+            shuffle=True
+        )
+        # 使用测试集评估分类器
+        test_classifier_loader = get_loader(
+            npz_file=os.path.join(cfg["DATA_PATH_PREFIX"], "test.npz"),
+            batch_size=cfg["DOWNSTREAM_BATCH_SIZE"],
+            shuffle=False
+        )
+        print("✅ Datasets loaded successfully.")
+    except FileNotFoundError as e:
+        print(f"❌ Error loading data: {e}. Please check your `DATA_PATH_PREFIX`.")
+        return
 
-    train_embeddings, train_labels = extract_embeddings(encoder, train_loader, "训练集")
-    test_embeddings, test_labels = extract_embeddings(encoder, test_loader, "测试集")
-    
-    # 筛选出用于训练的正常样本
-    normal_train_mask = (train_labels == 0).flatten()
-    normal_train_embeddings = train_embeddings[normal_train_mask]
-    print(f"\n从训练集中筛选出 {len(normal_train_embeddings)} 个正常样本用于训练Isolation Forest。")
-    
-    # ========== 3. 训练Isolation Forest模型 ==========
-    print("\n[3/4] 正在训练 Isolation Forest 模型...")
-    # n_jobs=-1 使用所有可用的CPU核心以加速训练
-    iso_forest = IsolationForest(n_estimators=100, contamination='auto', random_state=42, n_jobs=-1)
-    iso_forest.fit(normal_train_embeddings)
-    print("✅ Isolation Forest 模型训练完成。")
+    # --- 加载并冻结预训练Encoder ---
+    print("\n🧊 [Step 3] Loading and freezing pre-trained encoder...")
+    pretrained_encoder = MyTimeSeriesEncoder(
+        patch_length=cfg["X_PATCH_LENGTH"],
+        num_vars=cfg["NUM_VARS"],
+        latent_dim=cfg["LATENT_DIM"],
+        time_layers=2, patch_layers=2, num_attention_heads=8,
+        ffn_dim=cfg["LATENT_DIM"] * 4, dropout=0.4
+    ).to(cfg["DEVICE"])
 
-    # ========== 4. 在测试集上评估模型 ==========
-    print("\n[4/4] 正在使用 Isolation Forest 在测试集上进行预测与评估...")
-    # 模型预测: +1 代表正常 (inlier), -1 代表异常 (outlier)
-    test_preds_iso = iso_forest.predict(test_embeddings)
+    try:
+        state_dict = torch.load(cfg["PRETRAINED_MODEL_PATH"], map_location=cfg["DEVICE"])
+        # 加载 online encoder 的权重
+        pretrained_encoder.load_state_dict(state_dict['encoder_online_state_dict'])
+    except FileNotFoundError:
+        print(f"❌ Error: Pre-trained model not found at '{cfg['PRETRAINED_MODEL_PATH']}'.")
+        return
+
+    for param in pretrained_encoder.parameters():
+        param.requires_grad = False
+    pretrained_encoder.eval()
+    print("✅ Pre-trained encoder loaded and frozen.")
+
+    # --- 初始化下游任务组件 ---
+    print("\n✨ [Step 4] Initializing new classifier and optimizer...")
+    downstream_classifier = StrongClassifier(input_dim=cfg["LATENT_DIM"]).to(cfg["DEVICE"])
+    optimizer = torch.optim.AdamW(downstream_classifier.parameters(), lr=cfg["DOWNSTREAM_LR"])
     
-    # 将预测结果映射到 0/1 标签 (0: 正常, 1: 异常)
-    # 这是评估指标所期望的格式
-    test_preds_mapped = np.array([0 if p == 1 else 1 for p in test_preds_iso])
+    def compute_global_anomaly_ratio(loader):
+        labels = [l for _, _, l in loader]
+        return torch.cat(labels, dim=0).float().mean().item()
+
+    anomaly_ratio = compute_global_anomaly_ratio(train_classifier_loader)
+    pos_weight = torch.tensor([(1 - anomaly_ratio) / (anomaly_ratio + 1e-6)], device=cfg["DEVICE"])
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    print(f"Classifier initialized. Anomaly ratio in training data: {anomaly_ratio:.4f}")
+
+    # --- 训练分类器 ---
+    print("\n💪 [Step 5] Starting classifier training...")
+    for epoch in range(1, cfg["DOWNSTREAM_EPOCHS"] + 1):
+        downstream_classifier.train()
+        total_loss = 0
+        for x_batch, _, labels_batch in train_classifier_loader:
+            x_batch, labels_batch = x_batch.to(cfg["DEVICE"]), labels_batch.to(cfg["DEVICE"])
+
+            # =================================================================
+            #  严格仿照您的训练脚本进行数据处理和特征提取
+            # =================================================================
+            # 1. 添加N_patch维度，使输入变为4D: (B, 1, T, F)
+            x_batch_4d = x_batch.unsqueeze(1)
+            
+            # 2. 使用实例归一化
+            x_batch_normed = apply_instance_norm(x_batch_4d)
+            
+            optimizer.zero_grad()
+            
+            # 3. 使用冻结的encoder提取特征
+            with torch.no_grad():
+                features = pretrained_encoder(x_batch_normed) # Shape: [B, SEQ, D], 此处 SEQ=1
+
+            # 4. 严格仿照L2/L3损失的维度处理方式
+            B, SEQ, D = features.shape
+            features_flat = features.reshape(B * SEQ, D)
+            labels_expanded = labels_batch.view(-1, 1).repeat(1, SEQ).view(-1, 1).float()
+            # =================================================================
+
+            # 5. 通过分类器得到预测
+            logits = downstream_classifier(features_flat)
+            
+            # 6. 计算损失并更新分类器
+            loss = criterion(logits, labels_expanded)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        
+        avg_train_loss = total_loss / len(train_classifier_loader)
+        print(f"[Epoch {epoch:02d}/{cfg['DOWNSTREAM_EPOCHS']}] Training... Train Loss: {avg_train_loss:.4f}")
     
-    # 计算评估指标
-    f1 = f1_score(test_labels, test_preds_mapped)
-    precision = precision_score(test_labels, test_preds_mapped)
-    recall = recall_score(test_labels, test_preds_mapped)
-    cm = confusion_matrix(test_labels, test_preds_mapped)
+    print("\n🏁 Training finished.")
+
+    # --- 在最后一个epoch后，进行最终评估 ---
+    print("\n🧪 [Step 6] Starting final evaluation on the test set...")
+    downstream_classifier.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad():
+        for x_batch, _, labels_batch in test_classifier_loader:
+            x_batch = x_batch.to(cfg["DEVICE"])
+
+            # 同样地，严格仿照训练脚本进行处理
+            x_batch_4d = x_batch.unsqueeze(1)
+            x_batch_normed = apply_instance_norm(x_batch_4d)
+            
+            features = pretrained_encoder(x_batch_normed)
+            
+            B, SEQ, D = features.shape
+            features_flat = features.reshape(B * SEQ, D)
+            logits = downstream_classifier(features_flat)
+            
+            all_preds.append((logits > 0).cpu().int().numpy())
+            all_labels.append(labels_batch.view(-1, 1).repeat(1, SEQ).view(-1, 1).numpy())
+
+    all_preds = np.concatenate(all_preds)
+    all_labels = np.concatenate(all_labels)
     
-    print("\n--- Isolation Forest 在测试集上的最终评估结果 ---")
-    print(f"  - F1 Score:  {f1:.4f}")
-    print(f"  - Precision: {precision:.4f}")
-    print(f"  - Recall:    {recall:.4f}")
-    print("  - Confusion Matrix:")
-    print(f"    {cm}")
-    print("-------------------------------------------------")
-    print("\n🎉 流程结束。")
+    f1 = f1_score(all_labels, all_preds, zero_division=0)
+    acc = accuracy_score(all_labels, all_preds)
+    prec = precision_score(all_labels, all_preds, zero_division=0)
+    rec = recall_score(all_labels, all_preds, zero_division=0)
+
+    print("\n--- ✅ Final Test Results ---")
+    print(f"F1-Score:  {f1:.4f}")
+    print(f"Accuracy:  {acc:.4f}")
+    print(f"Precision: {prec:.4f}")
+    print(f"Recall:    {rec:.4f}")
+    print("--------------------------")
+
+    print("\n🎉 Downstream task evaluation finished!")
 
 if __name__ == "__main__":
     main()

@@ -1,6 +1,7 @@
 import sys
 import os
 import copy
+import math
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
@@ -18,68 +19,53 @@ from jepa.predictor import JEPPredictor
 
 # ========= NEW: 定义分类器模型 =========
 class StrongClassifier(nn.Module):
-    """简化版分类器，移除BatchNorm以提高稳定性"""
+    """增强版分类器，用于更准确地判断latent表示中的异常"""
     def __init__(self, input_dim, hidden_dim=256):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.4),  # 增加dropout
+            nn.Dropout(0.3),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.ReLU(),
-            nn.Dropout(0.4),  # 增加dropout
             nn.Linear(hidden_dim // 2, 1)
         )
     def forward(self, x):
         return self.net(x)
 
-
-
-def apply_instance_norm(x, eps=1e-5):
-    """
-    对输入 x 的每个实例独立进行归一化
-    输入:
-        x: Tensor, shape (B, 1, T, F)
-    输出:
-        normalized x, shape 相同
-    """
-    # 保持Batch维度(B)和通道维度(1)独立，只在时间和特征维度上计算
-    mean = x.mean(dim=(2, 3), keepdim=True)
-    std = x.std(dim=(2, 3), keepdim=True)
-    return (x - mean) / (std + eps)
-
 # ========= 全局设置 (MODIFIED) =========
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 训练超参数 (保持不变)
-BATCH_SIZE               = 256
+BATCH_SIZE               = 128
 LATENT_DIM               = 128
 EPOCHS                   = 100  # 增加训练轮数
-LEARNING_RATE            = 2e-5  # 降低学习率以减缓过拟合
-WEIGHT_DECAY             = 1e-4  # 增加权重衰减以增强正则化
-EARLY_STOPPING_PATIENCE  = 20    # 增加早停耐心值
-EARLY_STOPPING_DELTA     = 1e-4  # 增加早停阈值
+LEARNING_RATE            = 5e-5  
+WEIGHT_DECAY             = 5e-5  
+EARLY_STOPPING_PATIENCE  = 20    
+EARLY_STOPPING_DELTA     = 1e-4  
 
 # --- NEW: 三个损失的权重 ---
 W1 = 1.0  # L1: 自监督损失 (包含recon和contra)
-W2 = 1.0  # L2: 来自pred_latent的分类损失
-W3 = 1.0  # L3: 来自tgt_latent的分类损失
+W2 = 0.8  # L2: 来自pred_latent的分类损失
+W3 = 5.0  # L3: 来自tgt_latent的分类损失
 
 # 自监督损失内部权重 (保持不变)
-RECONSTRUCTION_WEIGHT   = 0.9    # 重建损失权重
-CONTRASTIVE_WEIGHT      = 0.1    # 对比损失权重
+RECONSTRUCTION_WEIGHT   = 0.2    # 增加重建损失权重
+
 TEMPERATURE             = 0.1    # 增加温度参数
 
 # EMA 相关参数 (保持不变)
-EMA_MOMENTUM            = 0.95   # 降低EMA动量以加快收敛
-EMA_WARMUP_EPOCHS       = 5      # 减少预热轮数
+EMA_MOMENTUM            = 0.99
+EMA_WARMUP_EPOCHS       = 10
 EMA_WARMUP_MOMENTUM     = 0.95
 
 # 数据集配置 (保持不变)
-X_PATCH_LENGTH          = 30  # 修改为实际的输入序列长度
-NUM_VARS                = 1   # 修改为实际的变量数
-PREDICTION_STEPS        = 10  # 修改为实际的预测序列长度
-Y_PATCH_SIZE           = 10   # 修改为实际的预测序列长度
+PATCH_SIZE = 10  # 每个patch的时间步数
+NUM_VARS = 1       # 特征数
+PREDICTION_STEPS = 20  # 总的预测时间步数
+PRED_PATCH_NUM = math.ceil(PREDICTION_STEPS / PATCH_SIZE)  # 预测patch数
 
 # ========= 工具函数 (保持不变) =========
 def compute_contrastive_loss(pred: torch.Tensor, target: torch.Tensor, temperature: float) -> torch.Tensor:
@@ -135,28 +121,28 @@ bce_criterion = nn.BCEWithLogitsLoss(pos_weight=fixed_pos_weight)
 
 # ========= Step 2: 初始化模型 (MODIFIED) =========
 print("\n[Step 2] Initializing models...")
-# 1. 编码历史patch的encoder (30步)
+# 1. 编码历史patch的encoder (5个patch, 每个10步)
 encoder_online = MyTimeSeriesEncoder(
-    patch_length=X_PATCH_LENGTH,  # 30步
+    patch_length=PATCH_SIZE,  # patch长度
     num_vars=NUM_VARS,
     latent_dim=LATENT_DIM,
     time_layers=2,    # 增加时间层数
     patch_layers=2,   # 增加patch层数
     num_attention_heads=8,
     ffn_dim=LATENT_DIM*4,
-    dropout=0.4       # 增加dropout以增强正则化
+    dropout=0.3       # 增加dropout
 ).to(DEVICE)
 
-# 2. 编码未来patch的encoder (10步)
+# 2. 编码未来patch的encoder (PRED_PATCH_NUM个patch, 每个10步)
 encoder_target = MyTimeSeriesEncoder(
-    patch_length=Y_PATCH_SIZE,    # 10步，与predictor的patch_size保持一致
+    patch_length=PATCH_SIZE,    # patch长度
     num_vars=NUM_VARS,
     latent_dim=LATENT_DIM,
     time_layers=2,    # 增加时间层数
     patch_layers=2,   # 增加patch层数
     num_attention_heads=8,
     ffn_dim=LATENT_DIM*4,
-    dropout=0.4       # 增加dropout以增强正则化
+    dropout=0.3       # 增加dropout
 ).to(DEVICE)
 
 # 3. 初始化target encoder的参数（使用online encoder的参数）
@@ -167,12 +153,12 @@ for param_o, param_t in zip(encoder_online.parameters(), encoder_target.paramete
 # 4. 初始化predictor
 predictor = JEPPredictor(
     latent_dim=LATENT_DIM,
-    prediction_steps=PREDICTION_STEPS,
-    patch_size=Y_PATCH_SIZE,
+    prediction_steps=PREDICTION_STEPS,  # 预测的总时间步数
+    patch_size=PATCH_SIZE,            # 每个patch的时间步数
     num_layers=2,     # 增加层数
     num_heads=8,
     ffn_dim=LATENT_DIM*4,
-    dropout=0.4       # 增加dropout以增强正则化
+    dropout=0.3       # 增加dropout
 ).to(DEVICE)
 
 # 5. 初始化分类器
@@ -180,9 +166,9 @@ classifier1 = StrongClassifier(input_dim=LATENT_DIM).to(DEVICE)  # 使用增强�
 classifier2 = StrongClassifier(input_dim=LATENT_DIM).to(DEVICE)  # 使用增强版分类器
 
 print(f"Initialized models:")
-print(f"- encoder_online: patch_length={X_PATCH_LENGTH}")
-print(f"- encoder_target: patch_length={Y_PATCH_SIZE}")
-print(f"- predictor: prediction_steps={PREDICTION_STEPS}, patch_size={Y_PATCH_SIZE}")
+print(f"- encoder_online: patch_length={PATCH_SIZE}")
+print(f"- encoder_target: patch_length={PATCH_SIZE}")
+print(f"- predictor: prediction_steps={PREDICTION_STEPS}, patch_size={PATCH_SIZE}")
 print(f"- latent_dim={LATENT_DIM}\n")
 
 # --- MODIFIED: 更新优化器，加入分类器参数 ---
@@ -218,14 +204,6 @@ for epoch in range(1, EPOCHS + 1):
         labels_batch = labels_batch.to(DEVICE)
        
         
-        # 添加N_patch维度，使输入变为4D: (B, N_patch, T, F)
-        x_batch = x_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
-        y_batch = y_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
-        
-        # === 使用实例归一化 ===
-        x_batch = apply_instance_norm(x_batch)
-        y_batch = apply_instance_norm(y_batch)
-        
         optimizer.zero_grad()
         
         # --- L1 损失 (自监督) ---
@@ -237,27 +215,31 @@ for epoch in range(1, EPOCHS + 1):
         
         loss_recon = pred_loss  # 使用predictor返回的损失
         loss_contra = compute_contrastive_loss(pred_latent, tgt_latent, TEMPERATURE)
-        loss_L1 = (RECONSTRUCTION_WEIGHT * loss_recon) + (CONTRASTIVE_WEIGHT * loss_contra)
+        loss_L1 = (RECONSTRUCTION_WEIGHT * loss_recon) 
         
         # --- L2, L3 损失 (监督) ---
         B, SEQ, D = pred_latent.shape
         
         # 将latent和label都拉平，以便每个补丁都能独立计算损失
         pred_latent_flat = pred_latent.reshape(B * SEQ, D)
-        tgt_latent_flat = tgt_latent.reshape(B * SEQ, D)
-        # 修复标签维度：将标签扩展到每个patch
-        labels_batch_expanded = labels_batch.view(-1, 1).repeat(1, SEQ).view(-1, 1).float()
+
+        # 如果 labels_batch shape 是 [B, 1]，需要扩展成 [B, SEQ, 1]
+        if labels_batch.dim() == 2 and labels_batch.shape[1] == 1:
+            labels_batch = labels_batch.expand(-1, SEQ)
+
+        labels_batch_flat = labels_batch.reshape(-1, 1).float().to(pred_latent_flat.device)
         
         # 使用固定的pos_weight，不再每个batch重新计算
         # L2: 预测latent的分类损失（更新encoder和predictor）
-        logits_L2 = classifier1(pred_latent_flat)
-        loss_L2 = bce_criterion(logits_L2, labels_batch_expanded)
+        logits_L2 = classifier1(pred_latent_flat)  
+        logits_L2 = logits_L2.reshape(-1, 1)  # 保证和label一致
+        loss_L2 = bce_criterion(logits_L2, labels_batch_flat)
         
         # L3: 真实latent的分类损失（更新encoder和classifier2）
         tgt_latent_for_L3 = encoder_online(y_batch)  # 使用encoder_online编码Y，让L3的梯度可以传播到encoder_online
         tgt_latent_for_L3_flat = tgt_latent_for_L3.reshape(B * SEQ, D)
         logits_L3 = classifier2(tgt_latent_for_L3_flat)
-        loss_L3 = bce_criterion(logits_L3, labels_batch_expanded)
+        loss_L3 = bce_criterion(logits_L3, labels_batch_flat)
         
         # === 最终总损失 ===
         total_loss = (W1 * loss_L1) + (W2 * loss_L2) + (W3 * loss_L3)
@@ -298,32 +280,26 @@ for epoch in range(1, EPOCHS + 1):
             x_batch, y_batch = x_batch.to(DEVICE), y_batch.to(DEVICE)
             labels_batch = labels_batch.to(DEVICE)
             
-            # 添加N_patch维度，使输入变为4D: (B, N_patch, T, F)
-            x_batch = x_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
-            y_batch = y_batch.unsqueeze(1)  # (B, T, F) → (B, 1, T, F)
-            
-            # === 使用实例归一化 ===
-            x_batch = apply_instance_norm(x_batch)
-            y_batch = apply_instance_norm(y_batch)
-            
             ctx_latent = encoder_online(x_batch)
             tgt_latent = encoder_target(y_batch)
             val_pred_latent, val_pred_loss = predictor(ctx_latent, tgt_latent)
             
-            val_loss_L1 = (RECONSTRUCTION_WEIGHT * val_pred_loss) + \
-                          (CONTRASTIVE_WEIGHT * compute_contrastive_loss(val_pred_latent, tgt_latent, TEMPERATURE))
-
+            val_loss_L1 = (RECONSTRUCTION_WEIGHT * val_pred_loss) 
             B, SEQ, D = val_pred_latent.shape
             pred_latent_flat = val_pred_latent.reshape(B * SEQ, D)
-            tgt_latent_flat = tgt_latent.reshape(B * SEQ, D)
-            labels_batch_expanded = labels_batch.view(-1, 1).repeat(1, SEQ).view(-1, 1).float()
+
+            # 如果 labels_batch shape 是 [B, 1]，需要扩展成 [B, SEQ, 1]
+            if labels_batch.dim() == 2 and labels_batch.shape[1] == 1:
+                labels_batch = labels_batch.expand(-1, SEQ)
+
+            labels_batch_flat = labels_batch.reshape(-1, 1).float().to(pred_latent_flat.device)
             
             # 使用固定的pos_weight，不再每个batch重新计算
             logits_L2 = classifier1(pred_latent_flat)
             logits_L3 = classifier2(tgt_latent_flat)
             
-            val_loss_L2 = bce_criterion(logits_L2, labels_batch_expanded)
-            val_loss_L3 = bce_criterion(logits_L3, labels_batch_expanded)
+            val_loss_L2 = bce_criterion(logits_L2, labels_batch_flat)
+            val_loss_L3 = bce_criterion(logits_L3, labels_batch_flat)
             
             total_val_L1 += val_loss_L1.item()
             total_val_L2 += val_loss_L2.item()
@@ -351,10 +327,10 @@ for epoch in range(1, EPOCHS + 1):
             'val_loss': best_val_loss,
             'config': {
                 'latent_dim': LATENT_DIM,
-                'patch_length': X_PATCH_LENGTH,
+                'patch_length': PATCH_SIZE,
                 'num_vars': NUM_VARS,
                 'prediction_steps': PREDICTION_STEPS,
-                'patch_size': Y_PATCH_SIZE
+                'patch_size': PATCH_SIZE
             }
         }
         print(f"✅ [Epoch {epoch:02d}] New best model found! Total Val Loss: {best_val_loss:.4f}")
